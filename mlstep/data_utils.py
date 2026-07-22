@@ -11,8 +11,8 @@ import xarray as xr
 
 
 # Constants (decided in the data-analysis notebook)
-N_CLASSES = 5          # hard-coded: t2-9 alone contains no class-4 sample
-TRAIN_STEPS = (2, 3, 4, 5, 6, 7)
+N_CLASSES = 5          # hard-coded as we dont want the model to assume there are only 3 classes from the data
+TRAIN_STEPS = tuple(range(2,8))
 VAL_STEPS = (8,)
 TEST_STEPS = (9,)      # touch once, at the very end
 VAL_FRACTION = 0.15    # only used by split="random"
@@ -59,9 +59,11 @@ def build_features(timesteps):
             cols.append(load_variable(name, t).reshape(n, -1))
         boxes.append(np.concatenate(cols, axis=0).T)
         targets.append(np.log2(load_variable("ncsteps", t)).astype(np.int64).ravel())
-
+    # x: (1,575,936, 267) (row: no of total boxes, input features as cols)
+    # y: (1,575,936) (every box needs a label of no of halvings)
     x = np.concatenate(boxes, axis=0)
     y = np.concatenate(targets)
+    # verify that the design matrix has 267 col and every label lies between 0 and 4
     assert x.shape[1] == sum(n for n, _ in FEATURES.values())
     assert 0 <= y.min() and y.max() < N_CLASSES
     return x, y
@@ -72,16 +74,19 @@ def fit_preprocessing(train_x):
     per-column transform scales and post-transform mean/std."""
     counts = np.count_nonzero(train_x, axis=0)
     sums = np.abs(train_x).sum(axis=0, dtype=np.float64)
+    # scales is the absolute mean among non-zero observations
     scales = np.where(counts > 0, sums / np.maximum(counts, 1), 1.0)
     transformed = transform(train_x, scales)
-    mu = transformed.mean(axis=0, keepdims=True)
-    sd = transformed.std(axis=0, keepdims=True)
+    # calculating mean and standard deviation after transformations
+    mu = transformed.mean(axis=0, dtype=np.float64, keepdims=True)
+    sd = transformed.std(axis=0, dtype=np.float64, keepdims=True)
     sd[sd == 0] = 1.0
     return {"scales": scales, "mu": mu, "sd": sd}
 
 
 def transform(x, scales):
     """Apply each variable's transform to its column block."""
+    # dont want to modify the original array so we make a copy
     out = x.astype(np.float32).copy()
     j = 0
     for name, (n, tf) in FEATURES.items():
@@ -92,8 +97,7 @@ def transform(x, scales):
 
 def apply_preprocessing(x, stats):
     """Transform then standardise with frozen train-fitted stats."""
-    return ((transform(x, stats["scales"]) - stats["mu"])
-            / stats["sd"]).astype(np.float32)
+    return ((transform(x, stats["scales"]) - stats["mu"]) / stats["sd"]).astype(np.float32)
 
 
 def prepare_splits(split="time", include_t1=False, seed=0):
@@ -109,20 +113,22 @@ def prepare_splits(split="time", include_t1=False, seed=0):
         tr_x, tr_y = build_features(train_steps)
         va_x, va_y = build_features(VAL_STEPS)
     elif split == "random":
+        # t2-t8 are combined into one pool and a reproducible random generation of every box is created
         pool_x, pool_y = build_features(train_steps + VAL_STEPS)
         rng = np.random.default_rng(seed)
         idx = rng.permutation(len(pool_y))
         n_val = int(len(idx) * VAL_FRACTION)
         va_i, tr_i = idx[:n_val], idx[n_val:]
+        # once again splitting into our training and validation sets
         tr_x, tr_y = pool_x[tr_i], pool_y[tr_i]
         va_x, va_y = pool_x[va_i], pool_y[va_i]
     else:
         raise ValueError(f"unknown split: {split!r}")
 
     stats = fit_preprocessing(tr_x)      # train only — never refit on val/test
-    print(stats)
-    return {"train": (apply_preprocessing(tr_x, stats), tr_y),
+    # making sure that after standardisation every training feature has a mean of 0
+    tr_out = apply_preprocessing(tr_x, stats)
+    assert abs(tr_out.mean(0)).max() < 1e-3, abs(tr_out.mean(0)).max()
+    return {"train": (tr_out, tr_y),
             "val": (apply_preprocessing(va_x, stats), va_y),
             "stats": stats}
-
-prepare_splits()
