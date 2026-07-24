@@ -72,6 +72,9 @@ def build_features(timesteps):
 def fit_preprocessing(train_x):
     """All preprocessing statistics, from TRAINING data only:
     per-column transform scales and post-transform mean/std."""
+    # optimise this as there are some copiesbeing made that we dont need.
+
+
     counts = np.count_nonzero(train_x, axis=0)
     sums = np.abs(train_x).sum(axis=0, dtype=np.float64)
     # scales is the absolute mean among non-zero observations
@@ -87,7 +90,7 @@ def fit_preprocessing(train_x):
 def transform(x, scales):
     """Apply each variable's transform to its column block."""
     # dont want to modify the original array so we make a copy
-    out = x.astype(np.float32).copy()
+    out = np.array(x, dtype=np.float32, order="C", copy=True)
     j = 0
     for name, (n, tf) in FEATURES.items():
         out[:, j:j + n] = APPLY_TRANSFORM[tf](out[:, j:j + n], scales[j:j + n])
@@ -128,7 +131,16 @@ def prepare_splits(split="time", include_t1=False, seed=0):
     stats = fit_preprocessing(tr_x)      # train only — never refit on val/test
     # making sure that after standardisation every training feature has a mean of 0
     tr_out = apply_preprocessing(tr_x, stats)
-    assert abs(tr_out.mean(0)).max() < 1e-3, abs(tr_out.mean(0)).max()
+    train_feature_means = tr_out.mean(axis=0, dtype=np.float64)
+    max_abs_train_mean = float(np.abs(train_feature_means).max())
+
+
+    assert max_abs_train_mean < 1e-3, (
+        "Training features are not sufficiently centred: "
+        f"max |mean| = {max_abs_train_mean:.9f}"
+    )   
+
+
     return {"train": (tr_out, tr_y),
             "val": (apply_preprocessing(va_x, stats), va_y),
             "stats": stats}
