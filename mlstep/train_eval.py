@@ -1,274 +1,350 @@
+"""Train and evaluate the UKCA timestep-halving network."""
+
 import argparse
 import json
-import subprocess
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
+from sklearn.metrics import average_precision_score, roc_auc_score
 from torch import nn
 
-import data_utils
-from net import FCNN
+if __package__:
+    from . import data_utils
+    from .dashboard import LiveTrainingDashboard
+    from .net import FCNN
+else:
+    import data_utils
+    from dashboard import LiveTrainingDashboard
+    from net import FCNN
 
-SEED = 0
+# Edit these values directly when trying a different training setup.
+EPOCHS = 30
+BATCH_SIZE = 4096
+LEARNING_RATE = 1e-3
+WEIGHT_DECAY = 1e-4
+N_HIDDEN = 64
+TOP_FRACTION = 0.001
+FIRST_SEED = 0
+RUNS_DIR = Path(__file__).resolve().parent / "runs"
+PLOTS_DIR = Path(__file__).resolve().parent / "plots"
 
 
-def pr_auc(scores, y_any):
-    """Average precision (exact, full set); the metric of choice at 0.016% positives."""
-    order = np.argsort(-scores)
-    hits = y_any[order]
-    precision = np.cumsum(hits) / np.arange(1, hits.size + 1)
-    return float(precision[hits].mean()) if hits.any() else 0.0
+def confusion_matrix(y_true, y_pred, n_classes):
+    """Return counts with true classes in rows and predictions in columns."""
+    flat = y_true * n_classes + y_pred
+    return np.bincount(flat, minlength=n_classes**2).reshape(n_classes, n_classes)
 
 
-def evaluate(model, x, y, class_weights, batch=65536):
-    model.eval()
-    with torch.no_grad(): # prevent gradient storage to reduce memory usage
-        logits = torch.cat([model(x[i:i + batch]) for i in range(0, len(x), batch)])
-    
-    weighted_ce = nn.functional.cross_entropy(logits, y, weight=class_weights).item()
-    probabilities = torch.softmax(logits, dim=1)
-    # checking the prob that any halving is required
-    score_hard = (1.0 - probabilities[:, 0]).numpy()
-    y_np = y.numpy()
-    pos = y_np > 0
-    out = {"weighted_ce": weighted_ce,
-           "pr_auc": pr_auc(score_hard, pos),
-           "n_pos": int(pos.sum())}
-    # checking among the difficult boxes how far away is the predicted halving count
-    if pos.any():
-        pred = logits.argmax(dim=1).numpy()
-        # This is the mean absolute error on the positive boxes (halving >= 1)
-        out["mae_on_pos"] = float(np.abs(pred[pos] - y_np[pos]).mean()) 
-    return out
+def compute_metrics(probabilities, targets):
+    """Compute the small set of metrics used to compare experiments."""
+    probabilities = np.asarray(probabilities)
+    targets = np.asarray(targets)
+
+    positive = targets > 0
+    scores = 1 - probabilities[:, 0]
+    predictions = probabilities.argmax(axis=1)
+    n_positive = int(positive.sum())
+
+    ap = float(average_precision_score(positive, scores)) if n_positive else 0.0
+    roc_auc = (
+        float(roc_auc_score(positive, scores))
+        if n_positive and (~positive).any()
+        else None
+    )
+
+    top_n = max(1, int(np.ceil(TOP_FRACTION * len(targets))))
+    top = np.argsort(-scores)[:top_n]
+    metrics = {
+        "ap": ap,
+        "roc_auc": roc_auc,
+        "prevalence": float(positive.mean()),
+        "n_pos": n_positive,
+        "top_fraction": TOP_FRACTION,
+        "precision_at_top": float(positive[top].mean()),
+        "recall_at_top": (
+            float(positive[top].sum() / n_positive) if n_positive else None
+        ),
+        "false_positives": int(((predictions > 0) & ~positive).sum()),
+        "false_negatives": int(((predictions == 0) & positive).sum()),
+        "confusion": confusion_matrix(
+            targets, predictions, data_utils.N_CLASSES
+        ).tolist(),
+    }
+
+    if n_positive:
+        errors = predictions[positive] - targets[positive]
+        metrics["mae_on_pos"] = float(np.abs(errors).mean())
+        metrics["exact_on_pos"] = float((errors == 0).mean())
+        metrics["mean_signed_error"] = float(errors.mean())
+        metrics["underprediction_rate"] = float((errors < 0).mean())
+        metrics["overprediction_rate"] = float((errors > 0).mean())
+    else:
+        metrics["mae_on_pos"] = None
+        metrics["exact_on_pos"] = None
+        metrics["mean_signed_error"] = None
+        metrics["underprediction_rate"] = None
+        metrics["overprediction_rate"] = None
+
+    per_class = {}
+    for class_index in range(data_utils.N_CLASSES):
+        true_class = targets == class_index
+        predicted_class = predictions == class_index
+        support = int(true_class.sum())
+        n_predicted = int(predicted_class.sum())
+        per_class[class_index] = {
+            "support": support,
+            "predicted": n_predicted,
+            "recall": (float(predicted_class[true_class].mean()) if support else None),
+            "precision": (
+                float(true_class[predicted_class].mean()) if n_predicted else None
+            ),
+        }
+    metrics["per_class"] = per_class
+    return metrics
+
 
 def class_statistics(targets):
-    """ Returns the counts, empirical priors, and the inverse frequency class weights (lower freq -> higher weight)"""
-    counts = torch.bincount(targets, minlength = data_utils.N_CLASSES).float()
+    """Return empirical priors and balanced class weights."""
+    counts = torch.bincount(targets, minlength=data_utils.N_CLASSES).float()
     priors = counts / counts.sum()
-    weights = counts.sum() / (data_utils.N_CLASSES * counts.clamp_min(1))
-
+    weights = torch.zeros_like(counts)
+    present = counts > 0
+    weights[present] = counts[present].sum() / (present.sum() * counts[present])
     return counts, priors, weights
 
 
-def train(tr_x, tr_y, va_x, va_y, seed, epochs=30, batch_size=4096, lr=1e-3,
-          weight_decay=1e-4, n_hidden=64, verbose=False):
-    # controls model parameter initialisation
+def initial_logits(priors, weights):
+    """Return the best constant prediction for the weighted loss."""
+    probabilities = priors * weights
+    probabilities /= probabilities.sum()
+    return probabilities.clamp_min(1e-12).log()
+
+
+def evaluate(model, x, y, class_weights, batch_size=65536):
+    """Evaluate a model over a full array in manageable batches."""
+    model.eval()
+    with torch.no_grad():
+        logits = torch.cat(
+            [
+                model(x[start : start + batch_size])
+                for start in range(0, len(x), batch_size)
+            ]
+        )
+
+    probabilities = torch.softmax(logits, dim=1)
+    metrics = compute_metrics(probabilities.numpy(), y.numpy())
+    metrics["weighted_ce"] = nn.functional.cross_entropy(
+        logits, y, weight=class_weights
+    ).item()
+    metrics["unweighted_ce"] = nn.functional.cross_entropy(logits, y).item()
+    return metrics
+
+
+def train(
+    train_x,
+    train_y,
+    val_x,
+    val_y,
+    seed,
+    epochs=EPOCHS,
+    verbose=True,
+    epoch_callback=None,
+):
+    """Train one seeded network and return its history and model."""
     torch.manual_seed(seed)
-    # initialising the output bias in the FCNN
-    counts, priors, weights = class_statistics(tr_y)
-    model = FCNN(tr_x.shape[1], n_hidden=n_hidden, class_priors=priors.tolist())
-    # use adamW with weight decay to discourage excessively large weights
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    """
-    1)clear gradients from prev batch
-    2)perform forward pass
-    3)calculate weighted cross entropy
-    4)backpropogate
-    5)update model parameters
-    """
-    history, n = [], len(tr_x)
+    _, priors, weights = class_statistics(train_y)
+    model = FCNN(
+        train_x.shape[1],
+        data_utils.N_CLASSES,
+        n_hidden=N_HIDDEN,
+        init_logits=initial_logits(priors, weights),
+    )
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=LEARNING_RATE,
+        weight_decay=WEIGHT_DECAY,
+    )
+
+    history = []
     for epoch in range(epochs):
         model.train()
-        # create a reproducible random ordering of training samples
         generator = torch.Generator().manual_seed(seed + epoch)
-        permutation  = torch.randperm(n, generator=generator)
-        running_loss_sum = 0.0
-        running_weight_sum = 0.0
+        order = torch.randperm(len(train_x), generator=generator)
+        loss_sum = 0.0
+        weight_sum = 0.0
 
-        for i in range(0, n, batch_size):
-            idx = permutation[i:i + batch_size]
-            batch_x = tr_x[idx]
-            batch_y = tr_y[idx]
+        for start in range(0, len(order), BATCH_SIZE):
+            indices = order[start : start + BATCH_SIZE]
+            batch_x = train_x[indices]
+            batch_y = train_y[indices]
 
-            opt.zero_grad(set_to_none=True)
+            optimizer.zero_grad()
             logits = model(batch_x)
-            batch_loss_sum = nn.functional.cross_entropy(logits, batch_y, weight=weights, reduction="sum")
-            batch_weight_sum = weights[batch_y].sum()
+            batch_loss = nn.functional.cross_entropy(
+                logits,
+                batch_y,
+                weight=weights,
+                reduction="sum",
+            )
+            batch_weight = weights[batch_y].sum()
+            (batch_loss / batch_weight).backward()
+            optimizer.step()
 
-            loss = batch_loss_sum / batch_weight_sum
-            loss.backward()
-            opt.step()
+            loss_sum += batch_loss.item()
+            weight_sum += batch_weight.item()
 
-            running_loss_sum += batch_loss_sum.detach().item()
-            running_weight_sum += batch_weight_sum.item()
-
-        train_weighted_ce = (running_loss_sum / running_weight_sum)
-        # after evry training epoch, entire validation set is evaluated
-        val_metrics = evaluate(model, va_x, va_y, class_weights=weights)
-
-        history.append({
-            "epoch": epoch +1,
-            "train_weighted_ce": train_weighted_ce,
-            **val_metrics,
-        })
+        record = {
+            "epoch": epoch + 1,
+            "train_weighted_ce": loss_sum / weight_sum,
+            **evaluate(model, val_x, val_y, weights),
+        }
+        history.append(record)
+        if epoch_callback is not None:
+            epoch_callback(history)
         if verbose:
             print(
-                f"  seed {seed} "
-                f"epoch {epoch + 1:>3}  "
-                f"train CE {train_weighted_ce:.6f}  "
-                f"val CE {val_metrics['weighted_ce']:.6f}  "
-                f"val AP {val_metrics['pr_auc']:.6f}"
+                f"seed {seed} epoch {epoch + 1:>2}: "
+                f"train CE {record['train_weighted_ce']:.4f}, "
+                f"val CE {record['weighted_ce']:.4f}, "
+                f"AP {record['ap']:.4f}"
             )
+
     return history, model
 
 
-def run_experiment(config, seeds=5):
-    """
-    Performs one complete experiments for one configuration over several seeds
-    A configuration might be for example: 
-    {
-        "split": "time",
-        "include_t1": False,
-    }   
-    """
-    splits = data_utils.prepare_splits(split=config["split"],include_t1=config["include_t1"])
-    tr_x, tr_y = map(torch.from_numpy, map(np.ascontiguousarray, splits["train"]))
-    va_x, va_y = map(torch.from_numpy, map(np.ascontiguousarray, splits["val"]))
-    print(f"config {config} | train {tuple(tr_x.shape)} "
-          f"({int((tr_y > 0).sum())} pos) | val {tuple(va_x.shape)} "
-          f"({int((va_y > 0).sum())} pos)")
+def run_experiment(
+    split="time",
+    include_t1=False,
+    seeds=5,
+    epochs=EPOCHS,
+    live_plots=True,
+    baseline_metrics=None,
+):
+    """Train several seeds, update the dashboard, and save one JSON file."""
+    splits = data_utils.prepare_splits(split=split, include_t1=include_t1)
+    train_x, train_y = (
+        torch.from_numpy(np.ascontiguousarray(array)) for array in splits["train"]
+    )
+    val_x, val_y = (
+        torch.from_numpy(np.ascontiguousarray(array)) for array in splits["val"]
+    )
+    print(
+        f"train {tuple(train_x.shape)} ({int((train_y > 0).sum())} pos), "
+        f"val {tuple(val_x.shape)} ({int((val_y > 0).sum())} pos)"
+    )
 
-    results = []
-    for s in range(seeds):
-        history, _ = train(tr_x, tr_y, va_x, va_y, seed=SEED + s)
-        results.append(history[-1])
-        print(f"  seed {s}: PR-AUC {history[-1]['pr_auc']:.4f}  "
-              f"MAE|pos {history[-1].get('mae_on_pos', float('nan')):.3f}")
+    dashboard = None
+    if live_plots:
+        try:
+            dashboard = LiveTrainingDashboard(
+                data_utils.N_CLASSES,
+                baseline_metrics=baseline_metrics,
+            )
+        except Exception as error:
+            print(f"Could not open live dashboard: {error}")
 
-    aucs = np.array([r["pr_auc"] for r in results])
-    summary = {"pr_auc_mean": float(aucs.mean()), "pr_auc_std": float(aucs.std()),
-               "n_seeds": seeds}
-    print(f"  => PR-AUC {aucs.mean():.4f} +/- {aucs.std():.4f}")
-    # produces experiment tag e.g: "time_t1_0722-104233"
-    tag = (f"{config['split']}"
-           f"{'_t1' if config['include_t1'] else ''}"
-           f"_{time.strftime('%m%d-%H%M%S')}")
-    Path("runs").mkdir(exist_ok=True)
-    Path(f"runs/{tag}.json").write_text(json.dumps(
-        {"config": config, "git": _git_commit(), "seeds": results,
-         "summary": summary, "time": time.strftime("%Y-%m-%d %H:%M")}, indent=2))
-    print(f"  logged runs/{tag}.json")
+    histories = []
+    seed_results = []
+    completed_histories = []
+    for seed in range(FIRST_SEED, FIRST_SEED + seeds):
+        callback = None
+        if dashboard is not None:
+
+            def callback(current_history, current_seed=seed):
+                dashboard.update(
+                    current_seed,
+                    current_history,
+                    completed_histories,
+                )
+
+        history, _ = train(
+            train_x,
+            train_y,
+            val_x,
+            val_y,
+            seed=seed,
+            epochs=epochs,
+            epoch_callback=callback,
+        )
+        histories.append(history)
+        completed_histories.append((seed, history))
+        seed_results.append(
+            {
+                "seed": seed,
+                "final": history[-1],
+                "best": max(history, key=lambda record: record["ap"]),
+            }
+        )
+
+    final_aps = np.array([result["final"]["ap"] for result in seed_results])
+    best_aps = np.array([result["best"]["ap"] for result in seed_results])
+    summary = {
+        "final_ap_mean": float(final_aps.mean()),
+        "final_ap_std": (float(final_aps.std(ddof=1)) if len(final_aps) > 1 else 0.0),
+        "best_ap_mean": float(best_aps.mean()),
+        "best_ap_std": (float(best_aps.std(ddof=1)) if len(best_aps) > 1 else 0.0),
+        "n_seeds": seeds,
+    }
+    output = {
+        "config": {
+            "split": split,
+            "include_t1": include_t1,
+            "epochs": epochs,
+            "batch_size": BATCH_SIZE,
+            "learning_rate": LEARNING_RATE,
+            "weight_decay": WEIGHT_DECAY,
+            "n_hidden": N_HIDDEN,
+        },
+        "seeds": seed_results,
+        "histories": histories,
+        "summary": summary,
+    }
+
+    RUNS_DIR.mkdir(exist_ok=True)
+    tag = f"{split}{'_t1' if include_t1 else ''}_{time.strftime('%m%d-%H%M%S')}.json"
+    output_path = RUNS_DIR / tag
+    output_path.write_text(json.dumps(output, indent=2), encoding="utf-8")
+    print(
+        f"final AP {summary['final_ap_mean']:.4f} "
+        f"+/- {summary['final_ap_std']:.4f}\n"
+        f"saved {output_path}"
+    )
+    if dashboard is not None:
+        dashboard_path = PLOTS_DIR / (f"{output_path.stem}_dashboard.png")
+        dashboard.save(dashboard_path)
+        print(f"saved {dashboard_path}")
+        dashboard.finish()
     return summary
 
 
-def _git_commit():
-    try:
-        return subprocess.run(["git", "rev-parse", "--short", "HEAD"],
-                              capture_output=True, text=True).stdout.strip()
-    except OSError:
-        return "unknown"
-
-
-def run_checks(tr_x, tr_y):
-    counts, priors, weights = class_statistics(tr_y)
-    torch.manual_seed(SEED)
-
-    # 1. Verify prior-bias initialization and initial weighted loss.
-    model = FCNN(tr_x.shape[1],class_priors=priors.tolist(),)
-    # Create a small stratified subset so that every class present in the
-    # training data participates in the loss check.
-    check_indices = []
-    for class_index in range(data_utils.N_CLASSES):
-        class_indices = torch.nonzero(tr_y == class_index,as_tuple=False,).squeeze(1)
-        if class_indices.numel() > 0:
-            check_indices.append(class_indices[:128])
-
-    check_indices = torch.cat(check_indices)
-    check_x = tr_x[check_indices]
-    check_y = tr_y[check_indices]
-
-    # The bias itself should encode the empirical class-prior distribution.
-    expected_probabilities = priors.clamp_min(1e-12)
-    expected_probabilities = (expected_probabilities/ expected_probabilities.sum())
-    bias_probabilities = torch.softmax(model.head.bias,dim=0,)
-    assert torch.allclose(bias_probabilities,expected_probabilities,atol=1e-6,)
-    
-    # We deliberately retain the default random head weights. This allows
-    # gradients to reach the hidden layer from the first training batch.
-    assert model.head.weight.abs().sum() > 0
-    print("[check] prior bias initialization  OK")
-
-    # Verify the weighted cross-entropy calculation for the bias-only
-    # prediction. This is the analytically predictable special case.
-    bias_only_logits = model.head.bias.unsqueeze(0).expand(len(check_y),-1,)
-    measured_bias_only_loss = nn.functional.cross_entropy(bias_only_logits,check_y,weight=weights,)
-    sample_weights = weights[check_y]
-
-    expected_bias_only_loss = -(sample_weights* expected_probabilities.log()[check_y]).sum() / sample_weights.sum()
-    assert torch.allclose(measured_bias_only_loss,expected_bias_only_loss,atol=1e-6,)
-    print(
-        f"[check] bias-only weighted loss  "
-        f"{measured_bias_only_loss.item():.6f} = "
-        f"expected {expected_bias_only_loss.item():.6f}  OK"
-    )
-
-    # The real network also contains randomly initialized output weights,
-    # so its complete initial loss is input-dependent and need not equal
-    # the bias-only analytical loss. It should simply be finite.
-    with torch.no_grad():
-        actual_initial_logits = model(check_x)
-    actual_initial_loss = nn.functional.cross_entropy(actual_initial_logits,check_y,weight=weights,)
-    assert torch.isfinite(actual_initial_loss)
-    print(
-        f"[check] actual initial weighted loss  "
-        f"{actual_initial_loss.item():.6f}  finite  OK"
-    )
-    # 2. batch independence: gradient of output i touches only input i.
-    model = FCNN(tr_x.shape[1])
-    xi = torch.randn(4, tr_x.shape[1], requires_grad=True)
-    model(xi)[2].sum().backward()
-    g = xi.grad.abs().sum(dim=1)
-    assert g[2] > 0 and g[[0, 1, 3]].max() == 0
-    print("[check] batch independence  OK")
-
-    # 3. inputs just before the net: the 'source of truth' view.
-    bad = int(np.isnan(tr_x.numpy()).sum() + np.isinf(tr_x.numpy()).sum())
-    mu, sd = tr_x.numpy().mean(0), tr_x.numpy().std(0)
-    print(f"[check] inputs  NaN/Inf {bad}  |mean|max {np.abs(mu).max():.3f}  "
-          f"std range [{sd.min():.2f}, {sd.max():.2f}]  "
-          f"range [{tr_x.min():.1f}, {tr_x.max():.1f}]")
-    assert bad == 0 and np.abs(mu).max() < 1e-3
-
-    # 4. overfit a tiny set -> loss ~0 AND perfect accuracy, asserted.
-    pos = torch.nonzero(tr_y > 0).squeeze(1)
-    neg = torch.nonzero(tr_y == 0).squeeze(1)[:512]
-    xs, ys = tr_x[torch.cat([pos, neg])], tr_y[torch.cat([pos, neg])]
-    model = FCNN(tr_x.shape[1], n_hidden=256)
-    opt = torch.optim.Adam(model.parameters(), lr=3e-3)
-    for _ in range(2000):
-        opt.zero_grad()
-        loss = nn.functional.cross_entropy(model(xs), ys)
-        loss.backward()
-        opt.step()
-    with torch.no_grad():
-        final_logits = model(xs)
-        final_loss = nn.functional.cross_entropy(final_logits, ys,).item()
-        accuracy = (final_logits.argmax(dim=1) == ys).float().mean().item()
-    assert final_loss < 0.01, f"tiny-set overfit failed: loss={final_loss:.6f}"
-    assert accuracy == 1.0, f"tiny-set overfit failed: accuracy={accuracy:.6f}"
-    print(f"[check] overfit tiny  loss {final_loss:.6f}  acc {accuracy:.3f}  OK")
-
-
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--check", action="store_true")
-    ap.add_argument("--train", action="store_true")
-    ap.add_argument("--split", choices=["time", "random"], default="time")
-    ap.add_argument("--include-t1", action="store_true")
-    ap.add_argument("--seeds", type=int, default=5)
-    args = ap.parse_args()
+    """Run an experiment from the command line."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--split", choices=["time", "random"], default="time")
+    parser.add_argument("--include-t1", action="store_true")
+    parser.add_argument("--seeds", type=int, default=5)
+    parser.add_argument(
+        "--live-plots",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--baseline-json", type=Path)
+    args = parser.parse_args()
 
-    config = {"split": args.split, "include_t1": args.include_t1}
-
-    if args.check:
-        splits = data_utils.prepare_splits(**config)
-        tr_x, tr_y = map(torch.from_numpy, splits["train"])
-        run_checks(tr_x, tr_y)
-
-    if args.train:
-        run_experiment(config, seeds=args.seeds)
+    baseline_metrics = None
+    if args.baseline_json:
+        baseline_metrics = json.loads(args.baseline_json.read_text(encoding="utf-8"))[
+            "metrics"
+        ]
+    run_experiment(
+        split=args.split,
+        include_t1=args.include_t1,
+        seeds=args.seeds,
+        live_plots=args.live_plots,
+        baseline_metrics=baseline_metrics,
+    )
 
 
 if __name__ == "__main__":
