@@ -1,0 +1,259 @@
+"""Load UKCA data and prepare the train/validation/test split."""
+
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import xarray as xr
+
+# looks at absolute path for the data folder
+DATA = Path(__file__).resolve().parent / "24hr_data"
+N_CLASSES = 5  # hardcoded so the model doesnt resort to only predicting 3 halvings
+TRAIN_STEPS = tuple(range(2, 19))
+VAL_STEPS = tuple(range(19, 22))
+TEST_STEPS = tuple(range(22, 25))
+CHUNK_SIZE = 65_536  # rows per block when reducing over the design matrix
+GRID_SHAPE = (38, 72, 96)
+
+
+@dataclass(frozen=True)
+class Feature:
+    """Define our input features and any transformations that need to be applied."""
+    name: str
+    channels: int  # for vector inputs like tracer[]
+    transform: str
+
+
+FEATURES = (
+    Feature("temp", 1, "standard"),
+    Feature("pres", 1, "standard"),
+    Feature("water_vapour", 1, "log1p"),
+    Feature("cloud_frac", 1, "standard"),
+    Feature("qcl", 1, "log1p"),
+    Feature("cell_volume", 1, "standard"),
+    Feature("stratflag", 1, "standard"),
+    Feature("tracer", 83, "log1p"),
+    Feature("rhs", 83, "arcsinh"),
+    Feature("photol_rates", 60, "log1p"),
+    Feature("wetrt", 34, "log1p"),
+)
+FEATURE_GROUPS = tuple(feature.name for feature in FEATURES)
+
+
+@dataclass
+class Preprocesser:
+    """Convert atmospheric variables into inputs that a FCNN can train on reliably"""
+
+    scale: np.ndarray
+    # Since we standardise everything we check if mean=1 and srd = 0
+    mean: np.ndarray
+    std: np.ndarray
+    features: tuple[Feature, ...]
+
+    @classmethod
+    def fit_transform(cls, x: np.ndarray, features) -> tuple["Preprocesser", np.ndarray]:
+        """Applying transformations to training data and calculating statistics"""
+        x = np.asarray(x, dtype=np.float32, order="c")  # matrix get stored in contigous memory blocks
+        nonzero = np.zeros(x.shape[1], dtype=np.int64)
+        absolute_sum = np.zeros(x.shape[1])
+
+        for chunk in chunks(x):
+            nonzero += np.count_nonzero(chunk, axis=0)
+            absolute_sum += np.abs(chunk).sum(axis=0, dtype=np.float64)
+
+        scale = np.where(nonzero > 0, absolute_sum / np.maximum(nonzero, 1), 1.0).astype(np.float32)
+        # This applies the non linear transformations before everything gets standardised
+        transform_in_place(x, scale, features)
+
+        total = np.zeros(x.shape[1], dtype=np.float64)
+        for chunk in chunks(x):
+            total += chunk.sum(axis=0, dtype=np.float64)
+        mean = (total / len(x)).astype(np.float32)  # This should be 0
+
+        # calculating the transformed standard deviations (this should be 1)
+        squared_error = np.zeros(x.shape[1], dtype=np.float64)
+        for chunk in chunks(x):
+            squared_error += np.square(chunk - mean).sum(axis=0, dtype=np.float64)
+        std = np.sqrt(squared_error / len(x)).astype(np.float32)
+        std[std == 0] = 1.0  # a constant feature has 0 std so we make it 1 to allow for safe divisions
+
+        # actually standardising the training matrix
+        x -= mean
+        x /= std
+        return cls(scale, mean, std, features), x
+
+    def transform(self, x: np.ndarray, *, copy: bool = True) -> np.ndarray:
+        """
+        This transforms new data like our validation/test sets using the learned scale from
+        the training data to prevent leakage
+        """
+        out = np.array(x, dtype=np.float32, order="c", copy=copy)  # once again a contigious array
+        transform_in_place(out, self.scale, self.features)
+        # new data is standardised using the training mean and std
+        out -= self.mean
+        out /= self.std
+        return out
+
+    def state(self) -> dict[str, np.ndarray]:
+        """Retruns the learned numerical state(data statistics) to reproduce preprocessing"""
+        return {
+            "scale": self.scale,
+            "mean": self.mean,
+            "std": self.std,
+        }
+
+
+def chunks(x: np.ndarray):
+    """Splits the data into chunks for faster preprocessing"""
+    for start in range(0, len(x), CHUNK_SIZE):
+        yield x[start : start + CHUNK_SIZE]
+
+
+def feature_names(features: tuple[Feature, ...]) -> list[str]:
+    """Returns a stable name for each column in the matric so we can easily identify each feature"""
+    names = []
+    for feature in features:
+        if feature.channels == 1:  # all scalar inputs use their ordinary name
+            names.append(feature.name)
+        else:
+            names.extend(
+                f"{feature.name}[{index}]" for index in range(feature.channels)
+            )  # all vector inputs have their appropiate channel like rhs[20]
+    return names
+
+
+def feature_group_names(features: tuple[Feature, ...]) -> list[str]:
+    """
+    Returns the parent groups for each column.
+    This lets xgboost determine the overall importance of vector inputs rather than looking at the individual channels only
+    """
+    return [feature.name for feature in features for _ in range(feature.channels)]
+
+
+def halving_labels(ncsteps: np.ndarray) -> np.ndarray:
+    """Converts the ncsteps data into the no of halvings labels"""
+    values = np.asarray(ncsteps)
+    # we take the log of ncsteps to find the number of halvings
+    halvings = np.log2(values)
+    rounded = np.rint(halvings)  # np.log2 is a floating point calculations and we want integers
+    labels = rounded.astype(np.int64).ravel()
+    if labels.min() < 0 or labels.max() >= N_CLASSES:
+        raise ValueError(f"halving labels must be in between 0 and {N_CLASSES - 1}")
+    return labels
+
+
+def load_train_validation(
+    data_dir: Path, features: tuple[Feature, ...]
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    We use t2-t18 for training and t19-t21 for validation.
+    """
+    train_x, train_y = load_timesteps(data_dir, TRAIN_STEPS, features)
+    val_x, val_y = load_timesteps(data_dir, VAL_STEPS, features)
+    return train_x, train_y, val_x, val_y
+
+
+def load_timesteps(
+    data_dir: Path, timesteps: tuple[int, ...], features: tuple[Feature, ...]
+) -> tuple[np.ndarray, np.ndarray]:
+    """Reads the appropiate NETCDF files and load the data"""
+    targets = [halving_labels(load_variable(data_dir, "ncsteps", timestep)) for timestep in timesteps]
+    y = np.concatenate(targets)  # This is our target vector now
+    n_columns = sum(feature.channels for feature in features)  # calculating number of model input columns
+    x = np.empty((len(y), n_columns), dtype=np.float32)  # Allocate the complete feature matrix once
+    # Build the input feature matrix and load all the features
+    row_start = 0
+    for timestep, target in zip(timesteps, targets, strict=True):
+        row_stop = row_start + len(target)
+        block = x[row_start:row_stop]
+        column = 0
+
+        for feature in features:
+            values = load_variable(data_dir, feature.name, timestep, channels=feature.channels)
+            expected_size = feature.channels * len(target)
+            if values.size != expected_size:
+                raise ValueError(f"{feature.name}_{timestep}.nc has {values.size:,} values; expected {expected_size:,}")
+            next_column = column + feature.channels
+            block[:, column:next_column] = values.reshape(feature.channels, -1).T  # transpose to the correct format
+            column = next_column
+
+        row_start = row_stop
+
+    return x, y
+
+
+# perhaps make negative ratio a cli argument
+def random_undersampling(positive: np.ndarray, negative: np.ndarray, negative_ratio: int, seed: int) -> np.ndarray:
+    """
+    Instead of processing the entire dataset (containing mostly 0 halvings) we use undersampling where a new negative sample
+    is detected each epoch using a different seed so that in each epoch, positive examples appear often enough to influence the loss
+    and so the network can encounter different negatives over training.
+    - also reduces memory access --> faster epochs
+    **BUT the model sees a higher positive proportion of positives that exists in reality so its output should not automatically be
+    interpreted as the true probability of halving.
+    """
+    n_negative = min(len(negative), negative_ratio * len(positive))
+    generator = np.random.default_rng(seed)
+    sampled_negative = generator.choice(
+        negative,
+        size=n_negative,
+        replace=False,  # ensure the same row cannot be selected more than once
+    )
+    indices = np.concatenate([positive, sampled_negative])
+    generator.shuffle(indices)
+    return indices
+
+
+def training_index_pools(labels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Compute row-index pools once for repeated negative sampling."""
+    labels = np.asarray(labels)
+    return np.flatnonzero(labels > 0), np.flatnonzero(labels == 0)
+
+
+def class_counts(labels: np.ndarray) -> list[int]:
+    """Counts all five halving classes."""
+    return np.bincount(
+        np.asarray(labels, dtype=np.int64),
+        minlength=N_CLASSES,
+    ).tolist()
+
+
+def load_variable(data_dir: Path, name: str, timestep: int, channels: int = 1) -> np.ndarray:
+    """Load the variables data into memory and return them as a NumPy array"""
+    path = data_dir / f"{name}_{timestep}.nc"
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    expected_dims = ("z", "y", "x") if channels == 1 else ("s", "z", "y", "x")
+    expected_shape = GRID_SHAPE if channels == 1 else (channels, *GRID_SHAPE)
+    with xr.open_dataset(path) as dataset:
+        variable = dataset[name]
+        variable = variable.transpose(*expected_dims)
+        if variable.shape != expected_shape:
+            raise ValueError(f"{path} has shape {variable.shape}; expected {expected_shape}")
+        return np.asarray(variable.values)
+
+
+def transform_in_place(
+    x: np.ndarray,
+    scale: np.ndarray,
+    features: tuple[Feature, ...],
+) -> None:
+    """Define the transformations that can be applied"""
+    column = 0
+    # Process one feature group at a time
+    for feature in features:
+        next_column = column + feature.channels
+        block = x[:, column:next_column]
+        feature_scale = scale[column:next_column]
+
+        if feature.transform == "log1p":
+            np.maximum(block, 0, out=block)
+            block /= feature_scale
+            np.log1p(block, out=block)  # compresses large strongly positive skewed values while handling 0's safely
+        elif feature.transform == "arcsinh":
+            block /= feature_scale
+            np.arcsinh(block, out=block)  # similiar to logarithm but supports negative values and preserves their sign
+        elif feature.transform != "standard":
+            raise ValueError(f"unknown transform: {feature.transform}")
+
+        column = next_column
