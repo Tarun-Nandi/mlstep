@@ -2,6 +2,13 @@
 mlstep.egg-info/
 __pycache__/
 CMakeFiles/
+build/
+mlstep/data/
+mlstep/24hr_data
+plots/
+runs/
+mlstep/plots/
+mlstep/runs/
 
 # Specific files
 CMakeCache.txt
