@@ -8,7 +8,8 @@ from pathlib import Path
 
 import numpy as np
 import xgboost as xgb
-from data import (
+
+from mlstep.data import (
     DATA,
     FEATURES,
     N_CLASSES,
@@ -20,7 +21,7 @@ from data import (
     random_undersampling,
     training_index_pools,
 )
-from evaluation import (
+from mlstep.evaluation import (
     benchmark,
     detection_ap,
     evaluate,
@@ -133,7 +134,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
     dashboard = None
     callbacks = []
     if args.dashboard:
-        from dashboard import XGBoostTrainingDashboard  # noqa: PLC0415
+        from mlstep.dashboard import XGBoostTrainingDashboard  # noqa: PLC0415
 
         dashboard = XGBoostTrainingDashboard(task)
         # This callback must run before early stopping so it also receives the final round.

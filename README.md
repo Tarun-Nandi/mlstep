@@ -18,7 +18,6 @@ pip install -e .
 For a development install, some further steps are recommended:
 ```sh
 cd mlstep
-
 # Install optional dev dependencies
 pip install -e .[dev]
 
@@ -29,12 +28,12 @@ pre-commit install
 In order to run the models directly, use these:
 
 ```sh
-python net.py
-python net.py --multiclass
-python net.py --multiclass --dashboard
-python xgb.py
-python xgb.py --multiclass
-python xgb.py --multiclass --dashboard
+python -m mlstep.net
+python -m mlstep.net --multiclass
+python -m mlstep.net --multiclass --dashboard
+python -m mlstep.xgb
+python -m mlstep.xgb --multiclass
+python -m mlstep.xgb --multiclass --dashboard
 ```
 
 Both scripts train the binary hard-box detector by default. Add `--multiclass`

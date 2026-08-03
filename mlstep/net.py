@@ -9,7 +9,9 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from data import (
+from torch import nn
+
+from mlstep.data import (
     DATA,
     FEATURES,
     N_CLASSES,
@@ -21,7 +23,7 @@ from data import (
     random_undersampling,
     training_index_pools,
 )
-from evaluation import (
+from mlstep.evaluation import (
     benchmark,
     detection_ap,
     evaluate,
@@ -30,7 +32,6 @@ from evaluation import (
     threshold_at_recall,
     write_json,
 )
-from torch import nn
 
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "runs"
 INFERENCE_BATCH_SIZE = 65_536
@@ -392,7 +393,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
     val_x = torch.from_numpy(val_x_array)
     dashboard = None
     if args.dashboard:
-        from dashboard import LiveTrainingDashboard  # noqa: PLC0415
+        from mlstep.dashboard import LiveTrainingDashboard  # noqa: PLC0415
 
         dashboard = LiveTrainingDashboard()
     # Training both models and measuring time

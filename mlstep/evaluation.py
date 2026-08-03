@@ -8,8 +8,9 @@ from statistics import median
 
 import numpy as np
 import sklearn
-from data import TEST_STEPS, TRAIN_STEPS, VAL_STEPS, Feature, class_counts, feature_names
 from sklearn.metrics import average_precision_score
+
+from mlstep.data import TEST_STEPS, TRAIN_STEPS, VAL_STEPS, Feature, class_counts, feature_names
 
 TOP_FRACTION = 0.001
 PROBABILITY_NDIM = 2  # a probability matrix is two dimensional: (rows, classes)
