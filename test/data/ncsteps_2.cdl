@@ -1,9 +1,0 @@
-netcdf ncsteps_2 {
-dimensions:
-	x = 10 ;
-variables:
-	int ncsteps(x) ;
-data:
-
-ncsteps = 16, 1, 1, 1, 1, 1, 4, 1, 1, 1 ;
-}

@@ -1,9 +1,0 @@
-netcdf test_feature1d_3 {
-dimensions:
-	x = 10 ;
-variables:
-	float test_feature1d(x) ;
-data:
-
-test_feature1d = 20.0, 21.0, 22.0, 23.0, 24.0, 25.0, 26.0, 27.0, 28.0, 29.0 ;
-}
