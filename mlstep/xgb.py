@@ -1,13 +1,13 @@
+"""Binary and multiclass XGBoost training and evaluation."""
+
 import argparse
 import json
 import time
 from collections import defaultdict
 from pathlib import Path
 
-
 import numpy as np
 import xgboost as xgb
-
 from data import (
     DATA,
     FEATURES,
@@ -44,7 +44,7 @@ PARAMS = {
 
 
 def xgb_detection_ap(predictions: np.ndarray, matrix: xgb.DMatrix):
-    """Provides exact detection average precision for optional multiclass early stopping"""
+    """Provide exact detection average precision for optional multiclass early stopping."""
     return "detection_ap", detection_ap(predictions, matrix.get_label())
 
 
@@ -64,8 +64,8 @@ class XGBoostDashboardCallback(xgb.callback.TrainingCallback):
         return False
 
 
-def run(args: argparse.Namespace) -> dict:
-    """Conducts the complete XGBoost experiment"""
+def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
+    """Conduct the complete XGBoost experiment."""
     features = FEATURES
     names = feature_names(features)
     groups = [feature.name for feature in features]
@@ -79,10 +79,7 @@ def run(args: argparse.Namespace) -> dict:
         f"{task} XGBoost | train {train_x.shape} on t{TRAIN_STEPS[0]}-t{TRAIN_STEPS[-1]} "
         f"({int((train_y > 0).sum())} positives)"
     )
-    print(
-        f"validation {val_x.shape} on t{VAL_STEPS[0]}-t{VAL_STEPS[-1]} "
-        f"({int((val_y > 0).sum())} positives)"
-    )
+    print(f"validation {val_x.shape} on t{VAL_STEPS[0]}-t{VAL_STEPS[-1]} ({int((val_y > 0).sum())} positives)")
 
     # NOTE: only the multiclass path undersamples negatives, so the two tasks
     # are not trained on the same distribution and are not directly comparable.
@@ -94,7 +91,8 @@ def run(args: argparse.Namespace) -> dict:
     else:
         fit_x = train_x
         fit_y = (train_y > 0).astype(np.int32)
-    # Building the QuantileDMatrix objects (provides an quantized representation of the data for the histogram tree method)
+    # Building the QuantileDMatrix objects (provides an quantized representation
+    # of the data for the histogram tree method)
     matrix_options = {"max_bin": PARAMS["max_bin"]}
     if args.threads:
         matrix_options["nthread"] = args.threads
@@ -287,7 +285,7 @@ def run(args: argparse.Namespace) -> dict:
 def feature_importance(
     model: xgb.Booster, names: list[str], groups: list[str]
 ) -> tuple[dict[str, float], dict[str, float]]:
-    """Find the importance of scalar and vector inputs in the decision trees"""
+    """Find the importance of scalar and vector inputs in the decision trees."""
     gain = np.zeros(len(names), dtype=np.float64)
     # Create one importance value per model input column
     for feature, value in model.get_score(importance_type="total_gain").items():
@@ -306,7 +304,7 @@ def feature_importance(
 
 
 def parse_args() -> argparse.Namespace:
-    """Adding CLI arguments"""
+    """Adding CLI arguments."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", type=Path, default=DATA)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)

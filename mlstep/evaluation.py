@@ -8,11 +8,12 @@ from statistics import median
 
 import numpy as np
 import sklearn
+from data import TEST_STEPS, TRAIN_STEPS, VAL_STEPS, Feature, class_counts, feature_names
 from sklearn.metrics import average_precision_score
 
-from data import TEST_STEPS, TRAIN_STEPS, VAL_STEPS, Feature, class_counts, feature_names
-
 TOP_FRACTION = 0.001
+PROBABILITY_NDIM = 2  # a probability matrix is two dimensional: (rows, classes)
+BINARY_COLUMNS = 2  # more columns than this means genuine multiclass output
 
 
 def detection_scores(outputs: np.ndarray) -> np.ndarray:
@@ -20,8 +21,9 @@ def detection_scores(outputs: np.ndarray) -> np.ndarray:
     outputs = np.asarray(outputs)
     if outputs.ndim == 1:
         return outputs
-    if outputs.ndim != 2:
-        raise ValueError("model output must be a vector or probability matrix")
+    if outputs.ndim != PROBABILITY_NDIM:
+        msg = "model output must be a vector or probability matrix"
+        raise ValueError(msg)
     if outputs.shape[1] == 1:
         return outputs[:, 0]
     return outputs[:, 1:].sum(axis=1)
@@ -37,9 +39,10 @@ def detection_ap(outputs: np.ndarray, targets: np.ndarray) -> float:
 
 
 def threshold_at_recall(targets: np.ndarray, scores: np.ndarray, target_recall: float) -> float:
-    """Captures the highest score threshold that captures the target no of positives."""
+    """Return the highest score threshold that captures the target no of positives."""
     if not 0 < target_recall <= 1:
-        raise ValueError("target_recall must be in (0, 1]")
+        msg = "target_recall must be in (0, 1]"
+        raise ValueError(msg)
     # From the positive rows, we sort the detector scores in descending order
     positive_scores = np.sort(np.asarray(scores)[np.asarray(targets) > 0])[::-1]
     if not len(positive_scores):
@@ -62,21 +65,32 @@ def evaluate(
     targets = np.asarray(targets, dtype=np.int64)
     # Error checks on model output
     if targets.ndim != 1 or not len(targets):
-        raise ValueError("targets must be a non-empty one-dimensional array")
+        msg = "targets must be a non-empty one-dimensional array"
+        raise ValueError(msg)
     if len(outputs) != len(targets):
-        raise ValueError("expected one model output per target")
+        msg = "expected one model output per target"
+        raise ValueError(msg)
     if not np.isfinite(outputs).all():
-        raise ValueError("model outputs must be finite")
-    if outputs.ndim == 2 and np.any((outputs < 0) | (outputs > 1)):
-        raise ValueError("class probabilities must be in [0, 1]")
-    if outputs.ndim == 2 and outputs.shape[1] > 1 and not np.allclose(outputs.sum(axis=1), 1, rtol=1e-5, atol=1e-7):
-        raise ValueError("class probabilities must sum to one")
+        msg = "model outputs must be finite"
+        raise ValueError(msg)
+    if outputs.ndim == PROBABILITY_NDIM and np.any((outputs < 0) | (outputs > 1)):
+        msg = "class probabilities must be in [0, 1]"
+        raise ValueError(msg)
+    if (
+        outputs.ndim == PROBABILITY_NDIM
+        and outputs.shape[1] > 1
+        and not np.allclose(outputs.sum(axis=1), 1, rtol=1e-5, atol=1e-7)
+    ):
+        msg = "class probabilities must sum to one"
+        raise ValueError(msg)
 
     scores = detection_scores(outputs if detection_outputs is None else detection_outputs)
     if len(scores) != len(targets):
-        raise ValueError("expected one detection output per target")
+        msg = "expected one detection output per target"
+        raise ValueError(msg)
     if not np.isfinite(scores).all() or np.any((scores < 0) | (scores > 1)):
-        raise ValueError("detection scores must be in [0, 1]")
+        msg = "detection scores must be in [0, 1]"
+        raise ValueError(msg)
     positive = targets > 0
     n_positive = int(positive.sum())
     # if no frozen threshold is provided we choose one from the targets and the scores
@@ -84,7 +98,8 @@ def evaluate(
     if selected_here:
         threshold = threshold_at_recall(targets, scores, target_recall)
     if not np.isfinite(threshold) or not 0 <= threshold <= 1:
-        raise ValueError("threshold must be finite and in [0, 1]")
+        msg = "threshold must be finite and in [0, 1]"
+        raise ValueError(msg)
     if threshold_source is None:
         threshold_source = "selected on these data" if selected_here else "provided/frozen before evaluation"
     # Convert the scores into final hard box decisions
@@ -126,7 +141,7 @@ def evaluate(
             for sweep_recall in (0.80, 0.90, 0.95, 0.97, 0.99, 1.0)
         }
     # Some more optinal multiclass metrics
-    if outputs.ndim == 2 and outputs.shape[1] > 2:
+    if outputs.ndim == PROBABILITY_NDIM and outputs.shape[1] > BINARY_COLUMNS:
         metrics["severity"] = exact_halvings_metrics(outputs, targets, detected)
 
     return metrics
@@ -205,7 +220,7 @@ def write_json(path: Path, content: dict) -> None:
 
 
 def exact_halvings_metrics(outputs: np.ndarray, targets: np.ndarray, detected: np.ndarray) -> dict:
-    """Calculates final end to end multiclass metrics"""
+    """Calculate final end to end multiclass metrics."""
     n_classes = outputs.shape[1]
     positive = targets > 0
     predictions = np.where(detected, outputs[:, 1:].argmax(axis=1) + 1, 0)
@@ -241,7 +256,7 @@ def exact_halvings_metrics(outputs: np.ndarray, targets: np.ndarray, detected: n
 
 
 def operating_point(targets: np.ndarray, scores: np.ndarray, target_recall: float) -> dict:
-    """Helper used to build the validation recall sweep"""
+    """Build one operating point for the validation recall sweep."""
     threshold = threshold_at_recall(targets, scores, target_recall)
     counts = detection_counts(scores >= threshold, targets > 0)
     return {
@@ -259,7 +274,7 @@ def operating_point(targets: np.ndarray, scores: np.ndarray, target_recall: floa
 
 
 def detection_counts(detected: np.ndarray, positive: np.ndarray) -> dict[str, int]:
-    """Helper to calculate true positives/negatives + false positives/negatives"""
+    """Count true positives/negatives + false positives/negatives."""
     return {
         "true_positive": int(np.count_nonzero(detected & positive)),
         "false_positive": int(np.count_nonzero(detected & ~positive)),
@@ -269,17 +284,17 @@ def detection_counts(detected: np.ndarray, positive: np.ndarray) -> dict[str, in
 
 
 def mean_or_none(values: np.ndarray) -> float | None:
-    """Calculate a mean when atleast one example exists otherwise return None"""
+    """Calculate a mean when atleast one example exists otherwise return None."""
     return float(np.mean(values)) if len(values) else None
 
 
 def safe_divide(numerator: int, denominator: int) -> float:
-    """Peforms division that doesnt crach when denominator is 0"""
+    """Peforms division that doesnt crach when denominator is 0."""
     return numerator / denominator if denominator else 0.0
 
 
 def f_score(precision: float, recall: float, beta: float) -> float:
-    """Calculates the f0.5 metric"""
+    """Calculate the f0.5 metric."""
     beta_squared = beta**2
     denominator = beta_squared * precision + recall
     if not denominator:
@@ -288,7 +303,7 @@ def f_score(precision: float, recall: float, beta: float) -> float:
 
 
 def mcc(counts: dict[str, int]) -> float:
-    """Calculates the mcc metric"""
+    """Calculate the mcc metric."""
     tp = float(counts["true_positive"])
     fp = float(counts["false_positive"])
     fn = float(counts["false_negative"])
@@ -298,10 +313,12 @@ def mcc(counts: dict[str, int]) -> float:
 
 
 def json_default(value):
+    """Serialise Path and numpy values that json cannot handle natively."""
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, np.ndarray):
         return value.tolist()
     if isinstance(value, np.generic):
         return value.item()
-    raise TypeError(f"{type(value).__name__} is not JSON serializable")
+    msg = f"{type(value).__name__} is not JSON serializable"
+    raise TypeError(msg)

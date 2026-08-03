@@ -19,6 +19,7 @@ GRID_SHAPE = (38, 72, 96)
 @dataclass(frozen=True)
 class Feature:
     """Define our input features and any transformations that need to be applied."""
+
     name: str
     channels: int  # for vector inputs like tracer[]
     transform: str
@@ -42,7 +43,7 @@ FEATURE_GROUPS = tuple(feature.name for feature in FEATURES)
 
 @dataclass
 class Preprocesser:
-    """Convert atmospheric variables into inputs that a FCNN can train on reliably"""
+    """Convert atmospheric variables into inputs that a FCNN can train on reliably."""
 
     scale: np.ndarray
     # Since we standardise everything we check if mean=1 and srd = 0
@@ -52,7 +53,7 @@ class Preprocesser:
 
     @classmethod
     def fit_transform(cls, x: np.ndarray, features) -> tuple["Preprocesser", np.ndarray]:
-        """Applying transformations to training data and calculating statistics"""
+        """Apply transformations to training data and calculate statistics."""
         x = np.asarray(x, dtype=np.float32, order="c")  # matrix get stored in contigous memory blocks
         nonzero = np.zeros(x.shape[1], dtype=np.int64)
         absolute_sum = np.zeros(x.shape[1])
@@ -83,9 +84,9 @@ class Preprocesser:
         return cls(scale, mean, std, features), x
 
     def transform(self, x: np.ndarray, *, copy: bool = True) -> np.ndarray:
-        """
-        This transforms new data like our validation/test sets using the learned scale from
-        the training data to prevent leakage
+        """Transform new data like our validation/test sets.
+
+        Uses the scale learned from the training data to prevent leakage.
         """
         out = np.array(x, dtype=np.float32, order="c", copy=copy)  # once again a contigious array
         transform_in_place(out, self.scale, self.features)
@@ -95,7 +96,7 @@ class Preprocesser:
         return out
 
     def state(self) -> dict[str, np.ndarray]:
-        """Retruns the learned numerical state(data statistics) to reproduce preprocessing"""
+        """Retruns the learned numerical state(data statistics) to reproduce preprocessing."""
         return {
             "scale": self.scale,
             "mean": self.mean,
@@ -104,13 +105,13 @@ class Preprocesser:
 
 
 def chunks(x: np.ndarray):
-    """Splits the data into chunks for faster preprocessing"""
+    """Split the data into chunks for faster preprocessing."""
     for start in range(0, len(x), CHUNK_SIZE):
         yield x[start : start + CHUNK_SIZE]
 
 
 def feature_names(features: tuple[Feature, ...]) -> list[str]:
-    """Returns a stable name for each column in the matric so we can easily identify each feature"""
+    """Return a stable name for each column so we can easily identify each feature."""
     names = []
     for feature in features:
         if feature.channels == 1:  # all scalar inputs use their ordinary name
@@ -123,31 +124,31 @@ def feature_names(features: tuple[Feature, ...]) -> list[str]:
 
 
 def feature_group_names(features: tuple[Feature, ...]) -> list[str]:
-    """
-    Returns the parent groups for each column.
-    This lets xgboost determine the overall importance of vector inputs rather than looking at the individual channels only
+    """Return the parent group for each column.
+
+    This lets xgboost determine the overall importance of vector inputs rather
+    than looking at the individual channels only.
     """
     return [feature.name for feature in features for _ in range(feature.channels)]
 
 
 def halving_labels(ncsteps: np.ndarray) -> np.ndarray:
-    """Converts the ncsteps data into the no of halvings labels"""
+    """Convert the ncsteps data into the no of halvings labels."""
     values = np.asarray(ncsteps)
     # we take the log of ncsteps to find the number of halvings
     halvings = np.log2(values)
     rounded = np.rint(halvings)  # np.log2 is a floating point calculations and we want integers
     labels = rounded.astype(np.int64).ravel()
     if labels.min() < 0 or labels.max() >= N_CLASSES:
-        raise ValueError(f"halving labels must be in between 0 and {N_CLASSES - 1}")
+        msg = f"halving labels must be in between 0 and {N_CLASSES - 1}"
+        raise ValueError(msg)
     return labels
 
 
 def load_train_validation(
     data_dir: Path, features: tuple[Feature, ...]
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    We use t2-t18 for training and t19-t21 for validation.
-    """
+    """We use t2-t18 for training and t19-t21 for validation."""
     train_x, train_y = load_timesteps(data_dir, TRAIN_STEPS, features)
     val_x, val_y = load_timesteps(data_dir, VAL_STEPS, features)
     return train_x, train_y, val_x, val_y
@@ -156,7 +157,7 @@ def load_train_validation(
 def load_timesteps(
     data_dir: Path, timesteps: tuple[int, ...], features: tuple[Feature, ...]
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Reads the appropiate NETCDF files and load the data"""
+    """Read the appropriate NetCDF files and load the data."""
     targets = [halving_labels(load_variable(data_dir, "ncsteps", timestep)) for timestep in timesteps]
     y = np.concatenate(targets)  # This is our target vector now
     n_columns = sum(feature.channels for feature in features)  # calculating number of model input columns
@@ -172,7 +173,8 @@ def load_timesteps(
             values = load_variable(data_dir, feature.name, timestep, channels=feature.channels)
             expected_size = feature.channels * len(target)
             if values.size != expected_size:
-                raise ValueError(f"{feature.name}_{timestep}.nc has {values.size:,} values; expected {expected_size:,}")
+                msg = f"{feature.name}_{timestep}.nc has {values.size:,} values; expected {expected_size:,}"
+                raise ValueError(msg)
             next_column = column + feature.channels
             block[:, column:next_column] = values.reshape(feature.channels, -1).T  # transpose to the correct format
             column = next_column
@@ -184,13 +186,17 @@ def load_timesteps(
 
 # perhaps make negative ratio a cli argument
 def random_undersampling(positive: np.ndarray, negative: np.ndarray, negative_ratio: int, seed: int) -> np.ndarray:
-    """
-    Instead of processing the entire dataset (containing mostly 0 halvings) we use undersampling where a new negative sample
-    is detected each epoch using a different seed so that in each epoch, positive examples appear often enough to influence the loss
-    and so the network can encounter different negatives over training.
+    """Keep every positive and sample a fixed ratio of negatives.
+
+    Instead of processing the entire dataset (containing mostly 0 halvings) we use
+    undersampling where a new negative sample is detected each epoch using a
+    different seed so that in each epoch, positive examples appear often enough to
+    influence the loss and so the network can encounter different negatives over
+    training.
     - also reduces memory access --> faster epochs
-    **BUT the model sees a higher positive proportion of positives that exists in reality so its output should not automatically be
-    interpreted as the true probability of halving.
+    **BUT the model sees a higher positive proportion of positives that exists in
+    reality so its output should not automatically be interpreted as the true
+    probability of halving.
     """
     n_negative = min(len(negative), negative_ratio * len(positive))
     generator = np.random.default_rng(seed)
@@ -211,7 +217,7 @@ def training_index_pools(labels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 def class_counts(labels: np.ndarray) -> list[int]:
-    """Counts all five halving classes."""
+    """Count all five halving classes."""
     return np.bincount(
         np.asarray(labels, dtype=np.int64),
         minlength=N_CLASSES,
@@ -219,7 +225,7 @@ def class_counts(labels: np.ndarray) -> list[int]:
 
 
 def load_variable(data_dir: Path, name: str, timestep: int, channels: int = 1) -> np.ndarray:
-    """Load the variables data into memory and return them as a NumPy array"""
+    """Load the variables data into memory and return them as a NumPy array."""
     path = data_dir / f"{name}_{timestep}.nc"
     if not path.is_file():
         raise FileNotFoundError(path)
@@ -229,7 +235,8 @@ def load_variable(data_dir: Path, name: str, timestep: int, channels: int = 1) -
         variable = dataset[name]
         variable = variable.transpose(*expected_dims)
         if variable.shape != expected_shape:
-            raise ValueError(f"{path} has shape {variable.shape}; expected {expected_shape}")
+            msg = f"{path} has shape {variable.shape}; expected {expected_shape}"
+            raise ValueError(msg)
         return np.asarray(variable.values)
 
 
@@ -238,7 +245,7 @@ def transform_in_place(
     scale: np.ndarray,
     features: tuple[Feature, ...],
 ) -> None:
-    """Define the transformations that can be applied"""
+    """Define the transformations that can be applied."""
     column = 0
     # Process one feature group at a time
     for feature in features:
@@ -254,6 +261,7 @@ def transform_in_place(
             block /= feature_scale
             np.arcsinh(block, out=block)  # similiar to logarithm but supports negative values and preserves their sign
         elif feature.transform != "standard":
-            raise ValueError(f"unknown transform: {feature.transform}")
+            msg = f"unknown transform: {feature.transform}"
+            raise ValueError(msg)
 
         column = next_column

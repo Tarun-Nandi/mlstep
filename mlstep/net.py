@@ -1,3 +1,5 @@
+"""FCNN hard-box detector and exact-halvings training and evaluation."""
+
 import argparse
 import math
 import os
@@ -7,15 +9,13 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch import nn
-
 from data import (
     DATA,
     FEATURES,
     N_CLASSES,
-    Preprocesser,
     TRAIN_STEPS,
     VAL_STEPS,
+    Preprocesser,
     feature_names,
     load_train_validation,
     random_undersampling,
@@ -30,7 +30,7 @@ from evaluation import (
     threshold_at_recall,
     write_json,
 )
-
+from torch import nn
 
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "runs"
 INFERENCE_BATCH_SIZE = 65_536
@@ -47,7 +47,7 @@ HARD_BOXES_DETECTOR_DROPOUT = 0.05  # 5% of hidden activations are randomly zero
 
 """
 The data for the exact halving model only uses positive examples so we can use a much
-smaller network with more epochs and stronger weight decay
+smaller network with more epochs and stronger weight decay.
 """
 EXACT_HALVINGS_HIDDEN_LAYERS = (64, 32)
 EXACT_HALVINGS_EPOCHS = 400
@@ -88,12 +88,12 @@ class FCNN(nn.Module):
                 self.layers[-1].bias.copy_(initial_bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass of mlp"""
+        """Forward pass of mlp."""
         return self.layers(x)
 
 
 def predict_hard_boxes_scores(hard_boxes_detector: FCNN, x: torch.Tensor, device: torch.device) -> np.ndarray:
-    """Produces uncalibrates scores for detecting any halving."""
+    """Produce uncalibrated scores for detecting any halving."""
     return batched_forward(hard_boxes_detector, x, device, lambda logits: torch.sigmoid(logits[:, 0]))
 
 
@@ -120,10 +120,10 @@ def predict_probabilities(
     exact_halvings: FCNN | None = None,
     threshold: float | None = None,
 ) -> np.ndarray:
-    """
-    -Calculates the hard boxes detection scores and the 5 class probabilities
-    - We have a threshold where if the hard box detection score is above a certain threshold, only then we use our second model
-    to evaluate exact halvings
+    """Calculate the hard boxes detection scores and the 5 class probabilities.
+
+    We have a threshold where if the hard box detection score is above a certain
+    threshold, only then we use our second model to evaluate exact halvings.
     """
     hard_detection = predict_hard_boxes_scores(hard_boxes_detector, x, device).astype(np.float64)
     # Allows binary training
@@ -151,7 +151,7 @@ def predict_probabilities(
 
 
 def hard_boxes_detector_loss(logits: torch.Tensor, targets: torch.Tensor, method: str) -> torch.Tensor:
-    """With the hard boxes detector we can experiment with three loss functions for now"""
+    """With the hard boxes detector we can experiment with three loss functions for now."""
     targets = targets.float()
     cross_entropy = nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction="none")
     if method == "bce":
@@ -167,7 +167,8 @@ def hard_boxes_detector_loss(logits: torch.Tensor, targets: torch.Tensor, method
         # ASL with gamma_positive=0, gamma_negative=4 and no clipping.
         modulation = torch.where(targets.bool(), torch.ones_like(probabilities), probabilities.pow(4))
         return (modulation * cross_entropy).mean()
-    raise ValueError(f"unknown detector loss: {method}")
+    msg = f"unknown detector loss: {method}"
+    raise ValueError(msg)
 
 
 def train_hard_boxes_detector(
@@ -186,6 +187,7 @@ def train_hard_boxes_detector(
     loss_method: str,
     on_epoch=None,
 ) -> tuple[FCNN, list[dict], int]:
+    """Train the binary detector and return it with its history and best epoch."""
     # Split the training row indices into hard boxes and ordinary boxes
     positive_indices, negative_indices = training_index_pools(train_y)
     n_negative = min(len(negative_indices), negative_ratio * len(positive_indices))
@@ -269,12 +271,13 @@ def train_exact_halvings(
     seed: int,
     on_epoch=None,
 ) -> tuple[FCNN, list[dict], int]:
-    """We train the exact halvings model only on rows where a halving occured"""
+    """We train the exact halvings model only on rows where a halving occured."""
     # Find only rows where atleast 1 halving occured.
     train_positive = np.flatnonzero(train_y > 0)
     val_positive = np.flatnonzero(val_y > 0)
     if not len(train_positive) or not len(val_positive):
-        raise ValueError("exact halving training requires positive train and validation rows")
+        msg = "exact halving training requires positive train and validation rows"
+        raise ValueError(msg)
     positive_x = train_x[torch.from_numpy(train_positive)]
     positive_y = torch.from_numpy(train_y[train_positive] - 1)
     val_positive_x = val_x[torch.from_numpy(val_positive)]
@@ -360,8 +363,8 @@ def train_exact_halvings(
     return model, history, best_epoch
 
 
-def run(args: argparse.Namespace) -> dict:
-    """This coordinates the complete experiment"""
+def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
+    """Coordinate the complete experiment."""
     features = FEATURES
     groups = [feature.name for feature in features]
     task = "multiclass" if args.multiclass else "binary"
@@ -375,10 +378,7 @@ def run(args: argparse.Namespace) -> dict:
         f"{task} FCNN | train {train_x_array.shape} on t{TRAIN_STEPS[0]}-t{TRAIN_STEPS[-1]} "
         f"({int((train_y > 0).sum())} positives)"
     )
-    print(
-        f"validation {val_x_array.shape} on t{VAL_STEPS[0]}-t{VAL_STEPS[-1]} "
-        f"({int((val_y > 0).sum())} positives)"
-    )
+    print(f"validation {val_x_array.shape} on t{VAL_STEPS[0]}-t{VAL_STEPS[-1]} ({int((val_y > 0).sum())} positives)")
 
     # Measure time to preprocess training + validation data
     started = time.perf_counter()
@@ -392,7 +392,7 @@ def run(args: argparse.Namespace) -> dict:
     val_x = torch.from_numpy(val_x_array)
     dashboard = None
     if args.dashboard:
-        from dashboard import LiveTrainingDashboard
+        from dashboard import LiveTrainingDashboard  # noqa: PLC0415
 
         dashboard = LiveTrainingDashboard()
     # Training both models and measuring time
@@ -578,6 +578,7 @@ def batched_forward(
     activation,
     indices: np.ndarray | None = None,
 ) -> np.ndarray:
+    """Run the model over x in batches and concatenate the activated outputs."""
     model.eval()  # Disables training behaviour such as dropout
     outputs = []
     # Whether to process every row or only select candidate rows
@@ -595,8 +596,10 @@ def batched_forward(
 
 
 def prior_logit(n_positive: int, n_negative: int) -> torch.Tensor:
+    """Return the output bias matching the positive rate of one undersampled epoch."""
     if not n_positive:
-        raise ValueError("training data contains no positives")
+        msg = "training data contains no positives"
+        raise ValueError(msg)
     # Calculates the positive fraction in one undersampled epoch
     probability = n_positive / (n_positive + n_negative)
     return torch.tensor([math.log(probability / (1 - probability))], dtype=torch.float32)
@@ -606,6 +609,7 @@ def exact_halvings_selection_metrics(
     probabilities: np.ndarray,
     targets: np.ndarray,
 ) -> dict:
+    """Score exact-halvings predictions for validation epoch selection."""
     # Convert physical indices 0-3 into physicsal classes 1-4
     predictions = probabilities.argmax(axis=1) + 1
     # prediction 1, target 3 -> error -2
@@ -620,20 +624,22 @@ def exact_halvings_selection_metrics(
 
 
 def cpu_state(model: nn.Module) -> dict[str, torch.Tensor]:
-    # Returns every saved weight and bias
+    """Return every saved weight and bias on the CPU."""
     return {name: value.detach().cpu() for name, value in model.state_dict().items()}
 
 
 def resolve_device(requested: str) -> torch.device:
-    """Choose CUDA when available otherwise resorts to CPU"""
+    """Choose CUDA when available otherwise resorts to CPU."""
     if requested == "auto":
         requested = "cuda" if torch.cuda.is_available() else "cpu"
     if requested == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA was requested but is not available")
+        msg = "CUDA was requested but is not available"
+        raise RuntimeError(msg)
     return torch.device(requested)
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse the command line arguments."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", type=Path, default=DATA)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
