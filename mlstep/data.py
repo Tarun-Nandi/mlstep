@@ -1,5 +1,6 @@
 """Load UKCA data and prepare the train/validation/test split."""
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -135,9 +136,18 @@ def feature_group_names(features: tuple[Feature, ...]) -> list[str]:
 def halving_labels(ncsteps: np.ndarray) -> np.ndarray:
     """Convert the ncsteps data into the no of halvings labels."""
     values = np.asarray(ncsteps)
+    if not values.size:
+        msg = "ncsteps must contain at least one value"
+        raise ValueError(msg)
+    if not np.isfinite(values).all() or np.any(values <= 0):
+        msg = "ncsteps values must be finite and positive"
+        raise ValueError(msg)
     # we take the log of ncsteps to find the number of halvings
     halvings = np.log2(values)
     rounded = np.rint(halvings)  # np.log2 is a floating point calculations and we want integers
+    if not np.allclose(halvings, rounded, rtol=0, atol=1e-12):
+        msg = "ncsteps values must be powers of two"
+        raise ValueError(msg)
     labels = rounded.astype(np.int64).ravel()
     if labels.min() < 0 or labels.max() >= N_CLASSES:
         msg = f"halving labels must be in between 0 and {N_CLASSES - 1}"
@@ -170,12 +180,32 @@ def split_timesteps(
     has never seen. A random split would put neighbouring timesteps on either
     side of the boundary and leak the same air masses into both.
     """
-    n_train = round(len(timesteps) * train_fraction)
-    n_validation = round(len(timesteps) * validation_fraction)
+    test_fraction = 1.0 - train_fraction - validation_fraction
+    fractions = (train_fraction, validation_fraction, test_fraction)
+    if not all(math.isfinite(fraction) and fraction > 0 for fraction in fractions):
+        msg = "train, validation and test fractions must all be positive"
+        raise ValueError(msg)
+
+    # Allocate whole timesteps using the largest-remainder method. This is
+    # closer to the requested fractions than independently rounding or taking
+    # every ceiling, while ensuring the three counts sum exactly to the input.
+    exact_counts = tuple(len(timesteps) * fraction for fraction in fractions)
+    counts = [math.floor(count) for count in exact_counts]
+    remaining = len(timesteps) - sum(counts)
+    remainders = tuple(exact - count for exact, count in zip(exact_counts, counts, strict=True))
+    # On an exact tie, protect the later held-out split first: test, then
+    # validation, then training.
+    allocation_order = sorted(range(len(counts)), key=lambda index: (remainders[index], index), reverse=True)
+    for index in allocation_order[:remaining]:
+        counts[index] += 1
+
+    n_train, n_validation, n_test = counts
+    if min(counts) == 0:
+        msg = "not enough timesteps to create non-empty train, validation and test splits"
+        raise ValueError(msg)
     train = timesteps[:n_train]
     validation = timesteps[n_train : n_train + n_validation]
-    # Our test set is all the timesteps left over (0.15) so we have a 70/15/15 split
-    test = timesteps[n_train + n_validation :]
+    test = timesteps[n_train + n_validation : n_train + n_validation + n_test]
     return train, validation, test
 
 
