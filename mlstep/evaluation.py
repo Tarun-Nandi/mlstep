@@ -10,7 +10,7 @@ import numpy as np
 import sklearn
 from sklearn.metrics import average_precision_score
 
-from mlstep.data import TEST_STEPS, TRAIN_STEPS, VAL_STEPS, Feature, class_counts, feature_names
+from mlstep.data import Feature, class_counts, feature_names
 
 TOP_FRACTION = 0.001
 PROBABILITY_NDIM = 2  # a probability matrix is two dimensional: (rows, classes)
@@ -174,16 +174,18 @@ def run_metadata(
     train_y: np.ndarray,
     val_y: np.ndarray,
     versions: dict[str, str],
+    splits: tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]],
 ) -> dict:
     """Build the status/config/data blocks shared by both training scripts."""
+    train_steps, validation_steps, test_steps = splits
     names = feature_names(features)
     groups = [feature.name for feature in features]
     return {
         "config": {
             **vars(args),
-            "train_steps": TRAIN_STEPS,
-            "validation_steps": VAL_STEPS,
-            "held_out_test_steps": TEST_STEPS,
+            "train_steps": train_steps,
+            "validation_steps": validation_steps,
+            "held_out_test_steps": test_steps,
             "test_set_used": False,
             "feature_groups": groups,
             "feature_names": names,

@@ -15,12 +15,12 @@ from mlstep.data import (
     DATA,
     FEATURES,
     N_CLASSES,
-    TRAIN_STEPS,
-    VAL_STEPS,
     Preprocesser,
+    discover_timesteps,
     feature_names,
     load_train_validation,
     random_undersampling,
+    split_timesteps,
     training_index_pools,
 )
 from mlstep.evaluation import (
@@ -371,15 +371,23 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
     task = "multiclass" if args.multiclass else "binary"
     device = resolve_device(args.device)  # set the appropiate device to train on
     torch.set_num_threads(args.threads)  # set the number of threads pytorch may use
+    timesteps = discover_timesteps(args.data_dir)
+    splits = split_timesteps(timesteps)
+    train_steps, validation_steps, _ = splits
     # Meaure time to load data
     started = time.perf_counter()
-    train_x_array, train_y, val_x_array, val_y = load_train_validation(args.data_dir, features)
+    train_x_array, train_y, val_x_array, val_y = load_train_validation(
+        args.data_dir, features, train_steps, validation_steps
+    )
     load_seconds = time.perf_counter() - started
     print(
-        f"{task} FCNN | train {train_x_array.shape} on t{TRAIN_STEPS[0]}-t{TRAIN_STEPS[-1]} "
+        f"{task} FCNN | train {train_x_array.shape} on t{train_steps[0]}-t{train_steps[-1]} "
         f"({int((train_y > 0).sum())} positives)"
     )
-    print(f"validation {val_x_array.shape} on t{VAL_STEPS[0]}-t{VAL_STEPS[-1]} ({int((val_y > 0).sum())} positives)")
+    print(
+        f"validation {val_x_array.shape} on t{validation_steps[0]}-t{validation_steps[-1]} "
+        f"({int((val_y > 0).sum())} positives)"
+    )
 
     # Measure time to preprocess training + validation data
     started = time.perf_counter()
@@ -513,7 +521,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
         model_path,
     )
     # Building the shared configuration and data summary as a JSON report
-    result = run_metadata(args, features, train_y, val_y, {"torch": torch.__version__})
+    result = run_metadata(args, features, train_y, val_y, {"torch": torch.__version__}, splits)
     result["config"].update(
         {
             "device": str(device),

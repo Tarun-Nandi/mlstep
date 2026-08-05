@@ -9,9 +9,9 @@ import xarray as xr
 # looks at absolute path for the data folder
 DATA = Path(__file__).resolve().parent / "24hr_data"
 N_CLASSES = 5  # hardcoded so the model doesnt resort to only predicting 3 halvings
-TRAIN_STEPS = tuple(range(2, 19))
-VAL_STEPS = tuple(range(19, 22))
-TEST_STEPS = tuple(range(22, 25))
+SPIN_UP_STEPS = 1  # We ignore the first timestep due to a spin up effect
+TRAIN_FRACTION = 0.7
+VALIDATION_FRACTION = 0.15
 CHUNK_SIZE = 65_536  # rows per block when reducing over the design matrix
 GRID_SHAPE = (38, 72, 96)
 
@@ -145,12 +145,49 @@ def halving_labels(ncsteps: np.ndarray) -> np.ndarray:
     return labels
 
 
+def discover_timesteps(data_dir: Path) -> tuple[int, ...]:
+    """Read the available timesteps from the data rather than a hardcoded range.
+
+    The split then follows whatever is on disk, so the same code works on the 24
+    hour set and on a longer run. The first SPIN_UP_STEPS are dropped because the
+    solver has not settled yet.
+    """
+    steps = sorted(int(path.stem.rsplit("_", 1)[-1]) for path in data_dir.glob("ncsteps_*.nc"))[SPIN_UP_STEPS:]
+    if not steps:
+        msg = f"No ncsteps_*.nc files found in {data_dir}."
+        raise ValueError(msg)
+    return tuple(steps)
+
+
+def split_timesteps(
+    timesteps: tuple[int, ...],
+    train_fraction: float = TRAIN_FRACTION,
+    validation_fraction: float = VALIDATION_FRACTION,
+) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    """Split the steps we find into train/val/test sets.
+
+    The split is chronological so validation and test come from times the model
+    has never seen. A random split would put neighbouring timesteps on either
+    side of the boundary and leak the same air masses into both.
+    """
+    n_train = round(len(timesteps) * train_fraction)
+    n_validation = round(len(timesteps) * validation_fraction)
+    train = timesteps[:n_train]
+    validation = timesteps[n_train : n_train + n_validation]
+    # Our test set is all the timesteps left over (0.15) so we have a 70/15/15 split
+    test = timesteps[n_train + n_validation :]
+    return train, validation, test
+
+
 def load_train_validation(
-    data_dir: Path, features: tuple[Feature, ...]
+    data_dir: Path,
+    features: tuple[Feature, ...],
+    train_steps: tuple[int, ...],
+    validation_steps: tuple[int, ...],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """We use t2-t18 for training and t19-t21 for validation."""
-    train_x, train_y = load_timesteps(data_dir, TRAIN_STEPS, features)
-    val_x, val_y = load_timesteps(data_dir, VAL_STEPS, features)
+    """Load the derived train and validation splits."""
+    train_x, train_y = load_timesteps(data_dir, train_steps, features)
+    val_x, val_y = load_timesteps(data_dir, validation_steps, features)
     return train_x, train_y, val_x, val_y
 
 

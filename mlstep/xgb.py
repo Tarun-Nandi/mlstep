@@ -13,12 +13,12 @@ from mlstep.data import (
     DATA,
     FEATURES,
     N_CLASSES,
-    TRAIN_STEPS,
-    VAL_STEPS,
+    discover_timesteps,
     feature_group_names,
     feature_names,
     load_train_validation,
     random_undersampling,
+    split_timesteps,
     training_index_pools,
 )
 from mlstep.evaluation import (
@@ -71,16 +71,22 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
     names = feature_names(features)
     groups = [feature.name for feature in features]
     task = "multiclass" if args.multiclass else "binary"
+    timesteps = discover_timesteps(args.data_dir)
+    splits = split_timesteps(timesteps)
+    train_steps, validation_steps, _ = splits
     # Measure time to load data
     started = time.perf_counter()
-    train_x, train_y, val_x, val_y = load_train_validation(args.data_dir, features)
+    train_x, train_y, val_x, val_y = load_train_validation(args.data_dir, features, train_steps, validation_steps)
     load_seconds = time.perf_counter() - started
     # We dont apply any transformations because XGBoost doesnt need any preprocessing
     print(
-        f"{task} XGBoost | train {train_x.shape} on t{TRAIN_STEPS[0]}-t{TRAIN_STEPS[-1]} "
+        f"{task} XGBoost | train {train_x.shape} on t{train_steps[0]}-t{train_steps[-1]} "
         f"({int((train_y > 0).sum())} positives)"
     )
-    print(f"validation {val_x.shape} on t{VAL_STEPS[0]}-t{VAL_STEPS[-1]} ({int((val_y > 0).sum())} positives)")
+    print(
+        f"validation {val_x.shape} on t{validation_steps[0]}-t{validation_steps[-1]} "
+        f"({int((val_y > 0).sum())} positives)"
+    )
 
     # NOTE: only the multiclass path undersamples negatives, so the two tasks
     # are not trained on the same distribution and are not directly comparable.
@@ -226,7 +232,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
         )
         dashboard.save(dashboard_path)
     # Constructing the final results
-    result = run_metadata(args, features, train_y, val_y, {"xgboost": xgb.__version__})
+    result = run_metadata(args, features, train_y, val_y, {"xgboost": xgb.__version__}, splits)
     result["config"].update(
         {
             "parameters": params,
