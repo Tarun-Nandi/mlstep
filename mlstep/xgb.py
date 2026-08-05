@@ -13,10 +13,13 @@ from mlstep.data import (
     DATA,
     FEATURES,
     N_CLASSES,
+    Feature,
     discover_timesteps,
     feature_group_names,
     feature_names,
-    load_train_validation,
+    load_labels,
+    load_selected_rows,
+    load_timesteps,
     random_undersampling,
     split_timesteps,
     training_index_pools,
@@ -65,6 +68,31 @@ class XGBoostDashboardCallback(xgb.callback.TrainingCallback):
         return False
 
 
+def load_training_data(
+    data_dir: Path,
+    timesteps: tuple[int, ...],
+    features: tuple[Feature, ...],
+    *,
+    multiclass: bool,
+    negative_ratio: int,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load the training representation required by an XGBoost task."""
+    if multiclass:
+        train_y, rows_per_timestep = load_labels(data_dir, timesteps)
+        if not np.any(train_y > 0):
+            msg = "the training split contains no positive halving examples"
+            raise ValueError(msg)
+        indices = random_undersampling(*training_index_pools(train_y), negative_ratio, seed)
+        fit_x = load_selected_rows(data_dir, timesteps, features, indices, rows_per_timestep)
+        fit_y = train_y[indices].astype(np.int32)
+        return fit_x, train_y, fit_y
+
+    fit_x, train_y = load_timesteps(data_dir, timesteps, features)
+    fit_y = (train_y > 0).astype(np.int32)
+    return fit_x, train_y, fit_y
+
+
 def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
     """Conduct the complete XGBoost experiment."""
     features = FEATURES
@@ -74,49 +102,62 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
     timesteps = discover_timesteps(args.data_dir)
     splits = split_timesteps(timesteps)
     train_steps, validation_steps, _ = splits
-    # Measure time to load data
+
+    # QuantileDMatrix stores a compact quantized representation for histogram
+    # training, so raw NumPy arrays can be released as soon as each matrix exists.
+    matrix_options = {"max_bin": PARAMS["max_bin"]}
+    if args.threads:
+        matrix_options["nthread"] = args.threads
     started = time.perf_counter()
-    train_x, train_y, val_x, val_y = load_train_validation(args.data_dir, features, train_steps, validation_steps)
-    load_seconds = time.perf_counter() - started
-    # We dont apply any transformations because XGBoost doesnt need any preprocessing
-    print(
-        f"{task} XGBoost | train {train_x.shape} on t{train_steps[0]}-t{train_steps[-1]} "
-        f"({int((train_y > 0).sum())} positives)"
+    fit_x, train_y, fit_y = load_training_data(
+        args.data_dir,
+        train_steps,
+        features,
+        multiclass=args.multiclass,
+        negative_ratio=args.negative_ratio,
+        seed=args.seed,
     )
+    training_load_seconds = time.perf_counter() - started
+    training_rows_used = len(fit_y)
+    training_class_counts_used = np.bincount(
+        fit_y.astype(np.int64, copy=False),
+        minlength=N_CLASSES if args.multiclass else 2,
+    ).tolist()
+
+    # XGBoost does not need the nonlinear preprocessing used by the FCNN.
+    print(
+        f"{task} XGBoost | train {(len(train_y), len(names))} on t{train_steps[0]}-t{train_steps[-1]} "
+        f"({int((train_y > 0).sum())} positives; {training_rows_used:,} rows used)"
+    )
+
+    started = time.perf_counter()
+    train_matrix = xgb.QuantileDMatrix(fit_x, label=fit_y, **matrix_options)
+    training_matrix_seconds = time.perf_counter() - started
+    del fit_x, fit_y
+
+    # Load validation only after the raw training matrix has been released. The
+    # complete validation array remains available for final metrics and timing.
+    started = time.perf_counter()
+    val_x, val_y = load_timesteps(args.data_dir, validation_steps, features)
+    validation_load_seconds = time.perf_counter() - started
     print(
         f"validation {val_x.shape} on t{validation_steps[0]}-t{validation_steps[-1]} "
         f"({int((val_y > 0).sum())} positives)"
     )
 
-    # NOTE: only the multiclass path undersamples negatives, so the two tasks
-    # are not trained on the same distribution and are not directly comparable.
-    # Same as FCNN we keep every class 1-4 row and sample class 0 rows to negative ratio
-    if args.multiclass:
-        indices = random_undersampling(*training_index_pools(train_y), args.negative_ratio, args.seed)
-        fit_x = train_x[indices]
-        fit_y = train_y[indices].astype(np.int32)
-    else:
-        fit_x = train_x
-        fit_y = (train_y > 0).astype(np.int32)
-    # Building the QuantileDMatrix objects (provides an quantized representation
-    # of the data for the histogram tree method)
-    matrix_options = {"max_bin": PARAMS["max_bin"]}
-    if args.threads:
-        matrix_options["nthread"] = args.threads
-
+    validation_labels = val_y if args.multiclass else (val_y > 0).astype(np.int32)
     started = time.perf_counter()
-    train_matrix = xgb.QuantileDMatrix(fit_x, label=fit_y, **matrix_options)
-    # Depening on binary/multiclass we store labels differently
     val_matrix = xgb.QuantileDMatrix(
         val_x,
-        label=val_y if args.multiclass else (val_y > 0).astype(np.int32),
+        label=validation_labels,
         ref=train_matrix,
         **matrix_options,
     )
-    training_rows_used = len(fit_y)
-    del train_x, fit_x, fit_y
-    # Record how long this quantisation took
-    matrix_seconds = time.perf_counter() - started
+    validation_matrix_seconds = time.perf_counter() - started
+    del validation_labels
+
+    load_seconds = training_load_seconds + validation_load_seconds
+    matrix_seconds = training_matrix_seconds + validation_matrix_seconds
     # Copy ths fixed params and add seed + device
     params = {**PARAMS, "seed": args.seed, "device": args.device}
     if args.threads:
@@ -194,7 +235,11 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
     )
     timing = {
         "data_loading_seconds": load_seconds,
+        "training_data_loading_seconds": training_load_seconds,
+        "validation_data_loading_seconds": validation_load_seconds,
         "matrix_construction_seconds": matrix_seconds,
+        "training_matrix_construction_seconds": training_matrix_seconds,
+        "validation_matrix_construction_seconds": validation_matrix_seconds,
         "training_seconds": training_seconds,
         "inference": inference,
     }
@@ -239,7 +284,13 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
             "score_context": score_context,
         }
     )
-    result["data"]["training_rows_used"] = training_rows_used
+    result["data"].update(
+        {
+            "training_loader": "selected_rows" if args.multiclass else "full_rows",
+            "training_rows_used": training_rows_used,
+            "training_class_counts_used": training_class_counts_used,
+        }
+    )
     result.update(
         {
             "task": task,

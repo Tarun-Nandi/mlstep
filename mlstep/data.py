@@ -221,24 +221,93 @@ def load_train_validation(
     return train_x, train_y, val_x, val_y
 
 
+def load_labels(data_dir: Path, timesteps: tuple[int, ...]) -> tuple[np.ndarray, tuple[int, ...]]:
+    """Load labels without allocating the corresponding feature matrix."""
+    targets = [halving_labels(load_variable(data_dir, "ncsteps", timestep)) for timestep in timesteps]
+    return np.concatenate(targets), tuple(len(target) for target in targets)
+
+
+def _selected_row_layout(
+    _,
+    selected_indices: np.ndarray,
+    rows_per_timestep: tuple[int, ...],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Group selected rows by their source timestep."""
+    row_counts = np.asarray(rows_per_timestep)
+    indices = np.asarray(selected_indices)
+    # Sorting groups disk reads by timestep. destination_rows maps each sorted
+    # source row back to its original, possibly shuffled output position.
+    destination_rows = np.argsort(indices, kind="stable")
+    sorted_indices = indices[destination_rows]
+    offsets = np.empty(len(row_counts) + 1, dtype=np.int64)
+    offsets[0] = 0
+    np.cumsum(row_counts, out=offsets[1:])
+    return row_counts, destination_rows, sorted_indices, offsets
+
+
+def load_selected_rows(
+    data_dir: Path,
+    timesteps: tuple[int, ...],
+    features: tuple[Feature, ...],
+    selected_indices: np.ndarray,
+    rows_per_timestep: tuple[int, ...],
+) -> np.ndarray:
+    """Load selected feature rows while preserving their requested order."""
+    row_counts, destination_rows, sorted_indices, offsets = _selected_row_layout(
+        timesteps, selected_indices, rows_per_timestep
+    )
+    n_columns = sum(feature.channels for feature in features)
+    out = np.empty((len(sorted_indices), n_columns), dtype=np.float32)
+    if not len(sorted_indices):
+        return out
+
+    loaded_rows = 0
+    for position, timestep in enumerate(timesteps):
+        row_start, row_stop = offsets[position : position + 2]
+        selected_start = np.searchsorted(sorted_indices, row_start, side="left")
+        selected_stop = np.searchsorted(sorted_indices, row_stop, side="left")
+        if selected_start == selected_stop:
+            continue
+
+        destinations = destination_rows[selected_start:selected_stop]
+        local_rows = sorted_indices[selected_start:selected_stop] - row_start
+        loaded_rows += len(destinations)
+        row_count = int(row_counts[position])
+        column = 0
+        for feature in features:
+            values = load_variable(data_dir, feature.name, timestep, channels=feature.channels)
+            expected_size = feature.channels * row_count
+            if values.size != expected_size:
+                msg = f"{feature.name}_{timestep}.nc has {values.size:,} values; expected {expected_size:,}"
+                raise ValueError(msg)
+            next_column = column + feature.channels
+            source = values.reshape(feature.channels, row_count).T
+            out[destinations, column:next_column] = source[local_rows]
+            column = next_column
+
+    if loaded_rows != len(sorted_indices):
+        msg = f"loaded {loaded_rows:,} selected rows; expected {len(sorted_indices):,}"
+        raise RuntimeError(msg)
+    return out
+
+
 def load_timesteps(
     data_dir: Path, timesteps: tuple[int, ...], features: tuple[Feature, ...]
 ) -> tuple[np.ndarray, np.ndarray]:
     """Read the appropriate NetCDF files and load the data."""
-    targets = [halving_labels(load_variable(data_dir, "ncsteps", timestep)) for timestep in timesteps]
-    y = np.concatenate(targets)  # This is our target vector now
+    y, rows_per_timestep = load_labels(data_dir, timesteps)
     n_columns = sum(feature.channels for feature in features)  # calculating number of model input columns
     x = np.empty((len(y), n_columns), dtype=np.float32)  # Allocate the complete feature matrix once
     # Build the input feature matrix and load all the features
     row_start = 0
-    for timestep, target in zip(timesteps, targets, strict=True):
-        row_stop = row_start + len(target)
+    for timestep, row_count in zip(timesteps, rows_per_timestep, strict=True):
+        row_stop = row_start + row_count
         block = x[row_start:row_stop]
         column = 0
 
         for feature in features:
             values = load_variable(data_dir, feature.name, timestep, channels=feature.channels)
-            expected_size = feature.channels * len(target)
+            expected_size = feature.channels * row_count
             if values.size != expected_size:
                 msg = f"{feature.name}_{timestep}.nc has {values.size:,} values; expected {expected_size:,}"
                 raise ValueError(msg)
