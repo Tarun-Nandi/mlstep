@@ -178,7 +178,7 @@ def split_timesteps(
 
     The split is chronological so validation and test come from times the model
     has never seen. A random split would put neighbouring timesteps on either
-    side of the boundary and leak the same air masses into both.
+    side of the boundary and leak the same data into both.
     """
     test_fraction = 1.0 - train_fraction - validation_fraction
     fractions = (train_fraction, validation_fraction, test_fraction)
