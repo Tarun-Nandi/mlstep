@@ -486,7 +486,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
     model_path, result_path = output_paths(args.output_dir, f"fcnn_{task}", ".pt")
     dashboard_path = None
     if dashboard is not None:
-        dashboard_path = Path(__file__).resolve().parent / "plots" / f"{model_path.stem}.png"
+        dashboard_path = args.output_dir.parent / "plots" / f"{model_path.stem}.png"
     architecture = {
         "hard_boxes_detector": {
             "hidden_layers": HARD_BOXES_DETECTOR_HIDDEN_LAYERS,
