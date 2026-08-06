@@ -29,7 +29,7 @@ class Feature:
 FEATURES = (
     Feature("temp", 1, "standard"),
     Feature("pres", 1, "standard"),
-    Feature("water_vapour", 1, "log1p"),
+    # Feature("water_vapour", 1, "log1p"),
     Feature("cloud_frac", 1, "standard"),
     Feature("qcl", 1, "log1p"),
     Feature("cell_volume", 1, "standard"),
