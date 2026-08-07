@@ -7,11 +7,13 @@ from typing import Final
 
 import numpy as np
 import xgboost as xgb
+from sklearn.preprocessing import QuantileTransformer
 
 from mlstep.data import (
     DATA,
     FEATURES,
     N_CLASSES,
+    Feature,
     Preprocesser,
     discover_timesteps,
     feature_names,
@@ -36,23 +38,62 @@ def severity_distribution(logits: np.ndarray) -> np.ndarray:
     return np.exp(logits_1to4 - logsumexp_1to4)
 
 
+def _apply_preprocessing(
+    x: np.ndarray,
+    method: str,
+    features: tuple[Feature, ...] | None = None,
+) -> tuple[Preprocesser | QuantileTransformer | None, np.ndarray]:
+    """Apply preprocessing method and return fitted preprocessor + transformed data."""
+    if method == "physical":
+        if features is None:
+            msg = "features required for physical preprocessing"
+            raise ValueError(msg)
+        return Preprocesser.fit_transform(x, features)
+
+    if method == "quantile":
+        n_quantiles = min(100_000, len(x))
+        transformer = QuantileTransformer(
+            output_distribution="normal",
+            n_quantiles=n_quantiles,
+            subsample=10_000_000,
+            random_state=0,
+        )
+        x_transformed = transformer.fit_transform(x.astype(np.float32))
+        return transformer, x_transformed
+
+    if method == "raw":
+        return None, x
+
+    msg = f"Unknown preprocessing method: {method}"
+    raise ValueError(msg)
+
+
 def _load_preprocess_features(
     data_dir: Path,
     train_steps: tuple[int, ...],
     val_steps: tuple[int, ...],
-) -> tuple[Preprocesser, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    preprocess_method: str,
+) -> tuple[Preprocesser | QuantileTransformer | None, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Load and preprocess training and validation features."""
     print("\nLoading training data...")
     train_x, train_y = load_timesteps(data_dir, train_steps, FEATURES)
     print(f"Loaded train_x: {train_x.shape}, {train_x.nbytes // 2**20:.1f} MB")
-    print("Preprocessing Training...")
-    preprocessor, train_x_processed = Preprocesser.fit_transform(train_x, FEATURES)
+
+    print(f"Preprocessing Training ({preprocess_method})...")
+    features_arg = FEATURES if preprocess_method == "physical" else None
+    preprocessor, train_x_processed = _apply_preprocessing(train_x, preprocess_method, features_arg)
 
     print("Loading validation data...")
     val_x, val_y = load_timesteps(data_dir, val_steps, FEATURES)
     print(f"Loaded val_x: {val_x.shape}, {val_x.nbytes // 2**20:.1f} MB")
-    print("Preprocessing validation...")
-    val_x_processed = preprocessor.transform(val_x, copy=False)
+
+    print(f"Preprocessing validation ({preprocess_method})...")
+    if preprocess_method == "physical":
+        val_x_processed = preprocessor.transform(val_x, copy=False)
+    elif preprocess_method == "quantile":
+        val_x_processed = preprocessor.transform(val_x.astype(np.float32))
+    else:  # raw
+        val_x_processed = val_x
 
     return preprocessor, train_x_processed, train_y, val_x_processed, val_y
 
@@ -63,7 +104,8 @@ def _save_features_and_labels(
     train_y: np.ndarray,
     val_x: np.ndarray,
     val_y: np.ndarray,
-    preprocessor: Preprocesser,
+    preprocessor: Preprocesser | QuantileTransformer | None,
+    preprocess_method: str,
 ) -> None:
     """Save features, labels, and preprocessor state."""
     print("Saving features and labels...")
@@ -72,11 +114,20 @@ def _save_features_and_labels(
     np.save(cache_dir / "val_x.npy", val_x)
     np.save(cache_dir / "val_y.npy", val_y)
 
-    preprocessor_state = {
-        **preprocessor.state(),
-        "features": [{"name": f.name, "channels": f.channels, "transform": f.transform} for f in FEATURES],
-    }
-    np.savez(cache_dir / "preprocessor_state.npz", **preprocessor_state)
+    if preprocess_method == "physical":
+        preprocessor_state = {
+            **preprocessor.state(),
+            "features": [{"name": f.name, "channels": f.channels, "transform": f.transform} for f in FEATURES],
+        }
+        np.savez(cache_dir / "preprocessor_state.npz", **preprocessor_state)
+    elif preprocess_method == "quantile":
+        np.savez(
+            cache_dir / "preprocessor_state.npz",
+            n_quantiles_in=preprocessor.n_quantiles_,
+            quantiles=preprocessor.quantiles_,
+        )
+    # For raw, save empty state to indicate no preprocessing
+    np.savez(cache_dir / "preprocessor_state.npz", method=preprocess_method)
 
 
 def _load_teacher(teacher_path: Path) -> tuple[xgb.XGBClassifier, dict, float]:
@@ -146,10 +197,12 @@ def _save_metadata(
     delta_t: float,
     train_class_counts: list[int],
     train_class_counts_used: list[int],
+    preprocess_method: str,
 ) -> None:
     """Save metadata for reproducibility."""
     metadata = {
         "cache_dir": str(cache_dir),
+        "preprocess": preprocess_method,
         "features": feature_names(FEATURES),
         "n_features": sum(f.channels for f in FEATURES),
         "train": {
@@ -185,15 +238,17 @@ def run(args: argparse.Namespace) -> None:
     print(f"Val: t{val_steps[0]}-t{val_steps[-1]} ({len(val_steps)} steps)")
 
     # Load and preprocess
-    preprocessor, train_x, train_y, val_x, val_y = _load_preprocess_features(args.data_dir, train_steps, val_steps)
+    preprocessor, train_x, train_y, val_x, val_y = _load_preprocess_features(
+        args.data_dir, train_steps, val_steps, args.preprocess
+    )
 
-    # Create cache directory
-    cache_dir = args.cache_dir / "week"
+    # Create cache directory (variant-specific)
+    cache_dir = args.cache_dir / "week" / args.preprocess
     cache_dir.mkdir(parents=True, exist_ok=True)
     print(f"\nCache directory: {cache_dir}")
 
     # Save features and labels
-    _save_features_and_labels(cache_dir, train_x, train_y, val_x, val_y, preprocessor)
+    _save_features_and_labels(cache_dir, train_x, train_y, val_x, val_y, preprocessor, args.preprocess)
 
     # Load teacher
     teacher, train_cc, train_cc_used, delta_t = _load_teacher(args.teacher_path)
@@ -212,6 +267,7 @@ def run(args: argparse.Namespace) -> None:
         delta_t,
         train_cc,
         train_cc_used,
+        args.preprocess,
     )
 
     # Summary
@@ -242,6 +298,13 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         required=True,
         help="Path to XGBoost .ubj teacher model",
+    )
+    parser.add_argument(
+        "--preprocess",
+        type=str,
+        default="physical",
+        choices=["physical", "quantile", "raw"],
+        help="Preprocessing method: physical (log/arcsinh+standardize), quantile (force N(0,1)), raw (no transform)",
     )
     return parser.parse_args()
 
