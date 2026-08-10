@@ -58,7 +58,8 @@ def _apply_preprocessing(
             subsample=10_000_000,
             random_state=0,
         )
-        x_transformed = transformer.fit_transform(x.astype(np.float32))
+        # Avoid full sized copy
+        x_transformed = transformer.fit_transform(x.astype(np.float32, copy=False))
         return transformer, x_transformed
 
     if method == "raw":
@@ -68,34 +69,39 @@ def _apply_preprocessing(
     raise ValueError(msg)
 
 
-def _load_preprocess_features(
-    data_dir: Path,
-    train_steps: tuple[int, ...],
-    val_steps: tuple[int, ...],
-    preprocess_method: str,
-) -> tuple[Preprocesser | QuantileTransformer | None, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Load and preprocess training and validation features."""
-    print("\nLoading training data...")
+def _load_features(
+    data_dir: Path, train_steps: tuple[int, ...], val_steps: tuple[int, ...]
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Load the raw training and validation features."""
+    print("\nLoading training data: ")
     train_x, train_y = load_timesteps(data_dir, train_steps, FEATURES)
     print(f"Loaded train_x: {train_x.shape}, {train_x.nbytes // 2**20:.1f} MB")
-
-    print(f"Preprocessing Training ({preprocess_method})...")
-    features_arg = FEATURES if preprocess_method == "physical" else None
-    preprocessor, train_x_processed = _apply_preprocessing(train_x, preprocess_method, features_arg)
-
-    print("Loading validation data...")
+    print("Loading validation data: ")
     val_x, val_y = load_timesteps(data_dir, val_steps, FEATURES)
     print(f"Loaded val_x: {val_x.shape}, {val_x.nbytes // 2**20:.1f} MB")
+    return train_x, train_y, val_x, val_y
 
+
+def _preprocess_features(
+    train_x: np.ndarray, val_x: np.ndarray, preprocess_method: str
+) -> tuple[Preprocesser | QuantileTransformer | None, np.ndarray, np.ndarray]:
+    """Fit preprocessing on training data and transform both of the splits."""
+    print(f"Preprocessing training ({preprocess_method})...")
+    features_arg = FEATURES if preprocess_method == "physical" else None
+    preprocessor, train_x_processed = _apply_preprocessing(
+        train_x,
+        preprocess_method,
+        features_arg,
+    )
     print(f"Preprocessing validation ({preprocess_method})...")
     if preprocess_method == "physical":
         val_x_processed = preprocessor.transform(val_x, copy=False)
     elif preprocess_method == "quantile":
-        val_x_processed = preprocessor.transform(val_x.astype(np.float32))
-    else:  # raw
+        val_x_processed = preprocessor.transform(val_x.astype(np.float32, copy=False))
+    else:
         val_x_processed = val_x
 
-    return preprocessor, train_x_processed, train_y, val_x_processed, val_y
+    return preprocessor, train_x_processed, val_x_processed
 
 
 def _save_features_and_labels(
@@ -126,11 +132,11 @@ def _save_features_and_labels(
             n_quantiles_in=preprocessor.n_quantiles_,
             quantiles=preprocessor.quantiles_,
         )
-    # For raw, save empty state to indicate no preprocessing
-    np.savez(cache_dir / "preprocessor_state.npz", method=preprocess_method)
+    else:
+        np.savez(cache_dir / "preprocessor_state.npz", method=preprocess_method)
 
 
-def _load_teacher(teacher_path: Path) -> tuple[xgb.XGBClassifier, dict, float]:
+def _load_teacher(teacher_path: Path) -> tuple[xgb.XGBClassifier, list[int], list[int], float]:
     """Load teacher model and extract class counts for prior correction."""
     print(f"\nLoading teacher from {teacher_path}...")
     teacher = xgb.XGBClassifier()
@@ -237,31 +243,47 @@ def run(args: argparse.Namespace) -> None:
     print(f"Train: t{train_steps[0]}-t{train_steps[-1]} ({len(train_steps)} steps)")
     print(f"Val: t{val_steps[0]}-t{val_steps[-1]} ({len(val_steps)} steps)")
 
-    # Load and preprocess
-    preprocessor, train_x, train_y, val_x, val_y = _load_preprocess_features(
-        args.data_dir, train_steps, val_steps, args.preprocess
+    # Load the raw features
+    train_x, train_y, val_x, val_y = _load_features(
+        args.data_dir,
+        train_steps,
+        val_steps,
     )
 
-    # Create cache directory (variant-specific)
+    # Create variant specific directory
     cache_dir = args.cache_dir / "week" / args.preprocess
     cache_dir.mkdir(parents=True, exist_ok=True)
-    print(f"\nCache directory: {cache_dir}")
 
-    # Save features and labels
-    _save_features_and_labels(cache_dir, train_x, train_y, val_x, val_y, preprocessor, args.preprocess)
-
-    # Load teacher
+    # Load the raw-feature teacher
     teacher, train_cc, train_cc_used, delta_t = _load_teacher(args.teacher_path)
 
     # Compute and save teacher targets
     _compute_and_save_teacher_targets(cache_dir, teacher, train_x, val_x, delta_t)
 
+    # Teacher inference is finished, so the arrays may now be transformed.
+    preprocessor, train_x_processed, val_x_processed = _preprocess_features(
+        train_x,
+        val_x,
+        args.preprocess,
+    )
+
+    # Save features and labels
+    _save_features_and_labels(
+        cache_dir,
+        train_x_processed,
+        train_y,
+        val_x_processed,
+        val_y,
+        preprocessor,
+        args.preprocess,
+    )
+
     # Save metadata
     _save_metadata(
         cache_dir,
-        train_x,
+        train_x_processed,
         train_y,
-        val_x,
+        val_x_processed,
         val_y,
         args.teacher_path,
         delta_t,
@@ -272,8 +294,8 @@ def run(args: argparse.Namespace) -> None:
 
     # Summary
     print("\n=== Summary ===")
-    print(f"Saved train_x: {train_x.shape}, {train_x.nbytes // 2**20:.1f} MB")
-    print(f"Saved val_x: {val_x.shape}, {val_x.nbytes // 2**20:.1f} MB")
+    print(f"Saved train_x: {train_x_processed.shape}, {train_x_processed.nbytes // 2**20:.1f} MB")
+    print(f"Saved val_x: {val_x_processed.shape}, {val_x_processed.nbytes // 2**20:.1f} MB")
     total_size = sum(f.stat().st_size for f in cache_dir.glob("*"))
     print(f"Total cache size: {total_size // 2**20:.1f} MB")
 
