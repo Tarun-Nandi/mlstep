@@ -19,10 +19,12 @@ from torch import nn
 
 from mlstep.data import N_CLASSES, random_undersampling, training_index_pools
 from mlstep.evaluation import (
+    detection_ap,
     epsilon_frontier,
     evaluate,
     halving_action_metrics,
     output_paths,
+    probability_metrics,
     threshold_at_recall,
     write_json,
 )
@@ -58,22 +60,35 @@ DEFAULT_NEGATIVE_RATIO: Final = 256
 DEFAULT_TARGET_RECALL: Final = 0.97
 CACHE_RESIDENCIES: Final = ("auto", "host", "cuda")
 DEFAULT_CACHE_RESIDENCY: Final = "auto"
+DEFAULT_LAMBDA_SEV: Final = 0.1
+DEFAULT_KD_TEMPERATURE: Final = 1.0
 GPU_DATA_RESERVE_BYTES: Final = 16 * 2**30
 LOAD_CHUNK_BYTES: Final = 512 * 2**20
 PROGRESS_UPDATES_PER_PHASE: Final = 10
+EPOCH_SEED_STRIDE: Final = 10_000
+SAMPLING_SEED_POLICY: Final = "run-seed-times-10000-plus-epoch-v1"
+DETECTOR_BIAS_POLICY: Final = "population-log-odds-v1"
+LOSS_COMPONENT_NAMES: Final = (
+    "total",
+    "hard_detector",
+    "hard_severity",
+    "kd_detector",
+    "kd_severity",
+)
+MEMBER_DIAGNOSTIC_TARGET_ROWS: Final = 262_144
+MEMBER_DIAGNOSTIC_SUBSET_POLICY: Final = "all-positives-plus-highest-ensemble-scores-v1"
 
-# Interim week-experiment policy. At each epoch, use the highest detector
-# threshold that achieves the requested recall. Then compare checkpoints
-# lexicographically using these criteria, rather than by detector AP alone.
-SELECTION_POLICY: Final = "recall-floor-exact-over-v1"
+# Checkpoints are selected before any hard action policy is fitted. RPS is the
+# primary proper score because the class labels are ordered; NLL and detector
+# AP are deterministic tie-breakers. The detector threshold and ASAD policy
+# are selected only after restoring the chosen probabilistic model.
+SELECTION_POLICY: Final = "ordinal-rps-nll-v1"
 THRESHOLD_RULE: Final = "highest validation threshold achieving target recall"
 THRESHOLD_SCORE: Final = "ensemble any-halving detector probability"
 SELECTION_CRITERIA: Final = (
-    "maximize severity.exact_on_positive_count",
-    "minimize severity.overprediction_count_all",
-    "minimize severity.overprediction_level_sum_all",
-    "minimize severity.underprediction_level_sum_all",
-    "maximize ap",
+    "minimize probability.ranked_probability_score",
+    "minimize probability.negative_log_likelihood",
+    "maximize detector average precision",
 )
 SEVERITY_DECISION: Final = "argmax conditional severity probability"
 
@@ -93,11 +108,35 @@ class TrainEpochResult:
     """Loss and phase timings for one unchanged undersampled epoch."""
 
     loss: float
+    loss_components: dict[str, float]
     sampled_rows: int
     batches: int
     sampling_seconds: float
     staging_seconds: float
     optimization_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class LossBreakdown:
+    """Weighted terms whose sum is the optimized scalar loss."""
+
+    total: torch.Tensor
+    hard_detector: torch.Tensor
+    hard_severity: torch.Tensor
+    kd_detector: torch.Tensor
+    kd_severity: torch.Tensor
+
+    def stacked(self) -> torch.Tensor:
+        """Return terms in the stable order used by training reports."""
+        return torch.stack(
+            (
+                self.total,
+                self.hard_detector,
+                self.hard_severity,
+                self.kd_detector,
+                self.kd_severity,
+            )
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,6 +256,18 @@ class Student(nn.Module):
             dim=-1,
         )
 
+    def initialize_detector_bias(self, population_log_odds: float) -> None:
+        """Initialize every detector member to the population class prior."""
+        if not np.isfinite(population_log_odds):
+            msg = "population_log_odds must be finite"
+            raise ValueError(msg)
+        bias = self.detector_head.bias
+        if bias is None:
+            msg = "The detector head must have a bias for prior initialization"
+            raise RuntimeError(msg)
+        with torch.no_grad():
+            bias.fill_(population_log_odds)
+
 
 def student_from_checkpoint(checkpoint: dict) -> Student:
     """Reconstruct a format-v2 student and strictly load its parameters.
@@ -272,11 +323,21 @@ def compute_loss(
     delta_s: float = 0.0,
     alpha: float = 1.0,
     beta: float = 0.5,
-    lambda_sev: float = 0.1,
+    lambda_sev: float = DEFAULT_LAMBDA_SEV,
     has_positive: bool | None = None,
-) -> torch.Tensor:
-    """Compute combined loss with optional distillation."""
+    kd_temperature: float = DEFAULT_KD_TEMPERATURE,
+    return_breakdown: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, LossBreakdown]:
+    """Compute hard-label and optional response-distillation losses.
+
+    Temperature applies to the conditional severity distributions only. The
+    teacher detector probability remains an untempered relevance gate, and
+    ``kd_temperature=1`` reproduces the original objective.
+    """
     n_members = d_logit.shape[0]
+    if not np.isfinite(kd_temperature) or kd_temperature <= 0.0:
+        msg = "kd_temperature must be finite and positive"
+        raise ValueError(msg)
     if (teacher_margin is None) != (teacher_severity is None):
         msg = "Teacher margin and severity targets must either both be present or both absent"
         raise ValueError(msg)
@@ -311,10 +372,12 @@ def compute_loss(
             severity_target.reshape(-1),
         )
 
-    gt_loss = detector_loss + lambda_sev * severity_loss
+    hard_detector = detector_loss
+    hard_severity = lambda_sev * severity_loss
 
     # Optional distillation
-    distill_loss = d_logit.new_zeros(())
+    kd_detector = d_logit.new_zeros(())
+    kd_severity = d_logit.new_zeros(())
 
     if teacher_margin is not None and teacher_severity is not None:
         teacher_margin_members = teacher_margin.unsqueeze(0).expand_as(d_logit)
@@ -325,12 +388,22 @@ def compute_loss(
             teacher_margin_members,
         )
 
-        # Use a valid T=1 probability distribution for the initial baseline.
+        # At T=1 this is exactly the original conditional-severity KD target.
         teacher_probability = teacher_severity.clamp_min(torch.finfo(s_logits.dtype).tiny)
         teacher_probability = teacher_probability / teacher_probability.sum(dim=-1, keepdim=True)
+        if kd_temperature == 1.0:
+            student_log_probability = F.log_softmax(s_logits, dim=-1)
+        else:
+            teacher_probability = torch.softmax(
+                torch.log(teacher_probability) / kd_temperature,
+                dim=-1,
+            )
+            student_log_probability = F.log_softmax(
+                s_logits / kd_temperature,
+                dim=-1,
+            )
         teacher_probability = teacher_probability.unsqueeze(0).expand(n_members, -1, -1)
 
-        student_log_probability = F.log_softmax(s_logits, dim=-1)
         severity_kl = F.kl_div(
             student_log_probability,
             teacher_probability,
@@ -338,31 +411,33 @@ def compute_loss(
         ).sum(dim=-1)
 
         teacher_detection_probability = torch.sigmoid(teacher_margin).unsqueeze(0)
-        severity_kl = (teacher_detection_probability * severity_kl).mean()
+        severity_kl = (teacher_detection_probability * severity_kl).mean() * kd_temperature**2
 
-        distill_loss = alpha * margin_loss + beta * severity_kl
+        kd_detector = alpha * margin_loss
+        kd_severity = beta * severity_kl
 
-    total_loss = gt_loss + distill_loss
+    total_loss = hard_detector + hard_severity + kd_detector + kd_severity
+    breakdown = LossBreakdown(
+        total=total_loss,
+        hard_detector=hard_detector,
+        hard_severity=hard_severity,
+        kd_detector=kd_detector,
+        kd_severity=kd_severity,
+    )
 
-    return total_loss
+    return (total_loss, breakdown) if return_breakdown else total_loss
 
 
-def checkpoint_selection_key(metrics: dict) -> tuple[int, int, int, int, float]:
-    """Return the lexicographic key used to select a student checkpoint.
-
-    Every checkpoint is evaluated at the highest detector threshold satisfying
-    the requested validation recall. Larger returned tuples are better.
-    """
-    severity = metrics.get("severity")
-    if severity is None:
-        msg = "Checkpoint selection requires multiclass severity metrics"
+def checkpoint_selection_key(metrics: dict) -> tuple[float, float, float]:
+    """Return a threshold-free proper-score checkpoint key; larger is better."""
+    probability = metrics.get("probability")
+    if probability is None:
+        msg = "Checkpoint selection requires joint probability metrics"
         raise ValueError(msg)
 
     return (
-        int(severity["exact_on_positive_count"]),
-        -int(severity["overprediction_count_all"]),
-        -int(severity["overprediction_level_sum_all"]),
-        -int(severity["underprediction_level_sum_all"]),
+        -float(probability["ranked_probability_score"]),
+        -float(probability["negative_log_likelihood"]),
         float(metrics["ap"]),
     )
 
@@ -577,6 +652,8 @@ def train_epoch(
     positive_indices: np.ndarray | None = None,
     negative_indices: np.ndarray | None = None,
     return_details: bool = False,
+    lambda_sev: float = DEFAULT_LAMBDA_SEV,
+    kd_temperature: float = DEFAULT_KD_TEMPERATURE,
 ) -> float | TrainEpochResult:
     """Train for one epoch with random undersampling."""
     model.train()
@@ -597,7 +674,11 @@ def train_epoch(
         device,
     )
 
-    loss_values = torch.empty(prepared.batches, device=device, dtype=torch.float32)
+    loss_values = torch.empty(
+        (prepared.batches, len(LOSS_COMPONENT_NAMES)),
+        device=device,
+        dtype=torch.float32,
+    )
     progress_every = _progress_interval(prepared.batches)
     optimization_start = time.perf_counter()
 
@@ -619,7 +700,7 @@ def train_epoch(
         d_logit, s_logits = model.forward_logits(batch_x)
 
         # Compute loss
-        loss = compute_loss(
+        loss_result = compute_loss(
             d_logit,
             s_logits,
             batch_y,
@@ -628,15 +709,22 @@ def train_epoch(
             delta_s=delta_s,
             alpha=alpha,
             beta=beta,
+            lambda_sev=lambda_sev,
+            kd_temperature=kd_temperature,
             has_positive=prepared.batch_has_positive[batch_number - 1],
+            return_breakdown=True,
         )
+        if not isinstance(loss_result, tuple):
+            msg = "Loss breakdown was requested but not returned"
+            raise TypeError(msg)
+        loss, breakdown = loss_result
 
         # Backward pass with gradient clipping
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), GRADIENT_CLIP_NORM)
         optimizer.step()
 
-        loss_values[batch_number - 1] = loss.detach()
+        loss_values[batch_number - 1] = breakdown.stacked().detach()
         if batch_number % progress_every == 0 or batch_number == prepared.batches:
             _synchronize(device)
             elapsed = time.perf_counter() - optimization_start
@@ -651,9 +739,14 @@ def train_epoch(
     optimization_seconds = time.perf_counter() - optimization_start
     # One transfer/synchronisation preserves the former Python-float summation
     # order without forcing a device sync after every optimizer step.
-    total_loss = sum(loss_values.cpu().tolist())
+    component_rows = loss_values.cpu().tolist()
+    loss_components = {
+        name: sum(row[column] for row in component_rows) / prepared.batches
+        for column, name in enumerate(LOSS_COMPONENT_NAMES)
+    }
     result = TrainEpochResult(
-        loss=total_loss / prepared.batches,
+        loss=loss_components["total"],
+        loss_components=loss_components,
         sampled_rows=prepared.sampled_rows,
         batches=prepared.batches,
         sampling_seconds=prepared.sampling_seconds,
@@ -720,6 +813,360 @@ def predict_joint_probabilities(
     q[:, 0] = 1.0 - d
     q[:, 1:] = d[:, None] * s
     return q, d
+
+
+def _stable_sigmoid(values: np.ndarray) -> np.ndarray:
+    """Evaluate sigmoid without overflowing large teacher margins."""
+    values = np.asarray(values)
+    output = np.empty(values.shape, dtype=np.result_type(values.dtype, np.float32))
+    nonnegative = values >= 0
+    output[nonnegative] = 1.0 / (1.0 + np.exp(-values[nonnegative]))
+    exponential = np.exp(values[~nonnegative])
+    output[~nonnegative] = exponential / (1.0 + exponential)
+    return output
+
+
+def _normalized_severity(probabilities: np.ndarray) -> np.ndarray:
+    """Return finite normalized conditional-severity probabilities."""
+    probabilities = np.asarray(probabilities)
+    if probabilities.ndim != MATRIX_NDIM or probabilities.shape[1] != N_SEVERITY_CLASSES:
+        msg = f"severity probabilities must have shape (rows, {N_SEVERITY_CLASSES})"
+        raise ValueError(msg)
+    if not np.isfinite(probabilities).all() or np.any(probabilities < 0.0):
+        msg = "severity probabilities must be finite and non-negative"
+        raise ValueError(msg)
+    row_sums = probabilities.sum(axis=1, keepdims=True)
+    if np.any(row_sums <= 0.0):
+        msg = "severity probability rows must have positive mass"
+        raise ValueError(msg)
+    return probabilities / row_sums
+
+
+def teacher_validation_diagnostics(
+    teacher_margin: np.ndarray,
+    teacher_severity: np.ndarray,
+    labels: np.ndarray,
+    target_recall: float,
+) -> dict:
+    """Evaluate the population-corrected responses cached from the teacher."""
+    labels = np.asarray(labels)
+    teacher_margin = np.asarray(teacher_margin)
+    if labels.ndim != 1 or teacher_margin.shape != labels.shape:
+        msg = "teacher margin and labels must be matching one-dimensional arrays"
+        raise ValueError(msg)
+    teacher_detector = _stable_sigmoid(teacher_margin)
+    teacher_conditional = _normalized_severity(teacher_severity)
+    if len(teacher_conditional) != len(labels):
+        msg = "teacher severity and labels must contain matching rows"
+        raise ValueError(msg)
+    teacher_joint = np.empty((len(labels), N_CLASSES), dtype=teacher_conditional.dtype)
+    teacher_joint[:, 0] = 1.0 - teacher_detector
+    teacher_joint[:, 1:] = teacher_detector[:, None] * teacher_conditional
+    teacher_metrics = evaluate(
+        teacher_joint,
+        labels,
+        target_recall=target_recall,
+        threshold_source="selected on cached teacher validation outputs",
+        detection_outputs=teacher_detector,
+    )
+    positive = labels > 0
+    if not positive.any():
+        msg = "teacher validation diagnostics require at least one positive label"
+        raise ValueError(msg)
+    conditional_exact = float(np.mean(teacher_conditional[positive].argmax(axis=1) + 1 == labels[positive]))
+    return {
+        "source": "population-prior-corrected cached XGBoost validation responses",
+        "detector_margin_scale": "population log-odds after removing the XGBoost undersampling shift",
+        "split": "validation",
+        "held_out": False,
+        "detector_ap": float(teacher_metrics["ap"]),
+        "conditional_severity_exact_on_true_positives": conditional_exact,
+        "metrics": teacher_metrics,
+    }
+
+
+def student_teacher_agreement(  # noqa: PLR0915
+    student_probabilities: np.ndarray,
+    student_detector: np.ndarray,
+    teacher_margin: np.ndarray,
+    teacher_severity: np.ndarray,
+    labels: np.ndarray,
+    student_threshold: float,
+    teacher_threshold: float,
+) -> dict:
+    """Compare final student responses with cached teacher responses."""
+    student_probabilities = np.asarray(student_probabilities)
+    student_detector = np.asarray(student_detector)
+    labels = np.asarray(labels)
+    teacher_margin = np.asarray(teacher_margin)
+    expected_joint_shape = (len(labels), N_CLASSES)
+    if labels.ndim != 1 or student_probabilities.shape != expected_joint_shape:
+        msg = f"student probabilities must have shape {expected_joint_shape}"
+        raise ValueError(msg)
+    if student_detector.shape != labels.shape or teacher_margin.shape != labels.shape:
+        msg = "student detector, teacher margin, and labels must have matching rows"
+        raise ValueError(msg)
+    teacher_detector = _stable_sigmoid(teacher_margin)
+    teacher_conditional = _normalized_severity(teacher_severity)
+    if len(teacher_conditional) != len(labels):
+        msg = "teacher severity and labels must contain matching rows"
+        raise ValueError(msg)
+    positive = labels > 0
+    if not positive.any():
+        msg = "student-teacher agreement requires at least one positive label"
+        raise ValueError(msg)
+    epsilon = np.finfo(np.float64).eps
+
+    detector_absolute_error_sum = 0.0
+    detector_absolute_error_positive_sum = 0.0
+    bernoulli_kl_sum = 0.0
+    bernoulli_kl_positive_sum = 0.0
+    joint_kl_sum = 0.0
+    joint_kl_positive_sum = 0.0
+    conditional_kl_weighted_sum = 0.0
+    teacher_positive_weight_sum = 0.0
+
+    chunk_rows = 1_000_000
+    for start in range(0, len(labels), chunk_rows):
+        stop = min(start + chunk_rows, len(labels))
+        student_d_raw = student_detector[start:stop].astype(np.float64)
+        teacher_d_raw = teacher_detector[start:stop].astype(np.float64)
+        chunk_positive = positive[start:stop]
+        detector_error = np.abs(student_d_raw - teacher_d_raw)
+        detector_absolute_error_sum += float(detector_error.sum())
+        detector_absolute_error_positive_sum += float(detector_error[chunk_positive].sum())
+
+        student_d = np.clip(student_d_raw, epsilon, 1.0 - epsilon)
+        teacher_d = np.clip(teacher_d_raw, epsilon, 1.0 - epsilon)
+        bernoulli_kl = teacher_d * np.log(teacher_d / student_d)
+        bernoulli_kl += (1.0 - teacher_d) * np.log((1.0 - teacher_d) / (1.0 - student_d))
+        bernoulli_kl_sum += float(bernoulli_kl.sum())
+        bernoulli_kl_positive_sum += float(bernoulli_kl[chunk_positive].sum())
+
+        teacher_s = teacher_conditional[start:stop].astype(np.float64, copy=False)
+        student_joint_raw = student_probabilities[start:stop].astype(np.float64)
+        student_positive_mass = student_joint_raw[:, 1:]
+        student_positive_total = student_positive_mass.sum(axis=1, keepdims=True)
+        student_s = np.divide(
+            student_positive_mass,
+            student_positive_total,
+            out=np.full_like(student_positive_mass, 1.0 / N_SEVERITY_CLASSES),
+            where=student_positive_total > 0.0,
+        )
+        student_s = np.clip(student_s, epsilon, 1.0)
+        student_s /= student_s.sum(axis=1, keepdims=True)
+
+        student_q = np.clip(student_joint_raw, epsilon, 1.0)
+        student_q /= student_q.sum(axis=1, keepdims=True)
+        teacher_q = np.empty_like(student_q)
+        teacher_q[:, 0] = 1.0 - teacher_d
+        teacher_q[:, 1:] = teacher_d[:, None] * teacher_s
+        teacher_q = np.clip(teacher_q, epsilon, 1.0)
+        teacher_q /= teacher_q.sum(axis=1, keepdims=True)
+        joint_kl = np.sum(teacher_q * (np.log(teacher_q) - np.log(student_q)), axis=1)
+        joint_kl_sum += float(joint_kl.sum())
+        joint_kl_positive_sum += float(joint_kl[chunk_positive].sum())
+
+        teacher_s_clipped = np.clip(teacher_s, epsilon, 1.0)
+        teacher_s_clipped /= teacher_s_clipped.sum(axis=1, keepdims=True)
+        conditional_kl = np.sum(
+            teacher_s_clipped * (np.log(teacher_s_clipped) - np.log(student_s)),
+            axis=1,
+        )
+        conditional_kl_weighted_sum += float((teacher_d * conditional_kl).sum())
+        teacher_positive_weight_sum += float(teacher_d.sum())
+
+    n_positive = int(positive.sum())
+    student_severity = student_probabilities[:, 1:].argmax(axis=1) + 1
+    teacher_severity_action = teacher_conditional.argmax(axis=1) + 1
+    student_actions = np.where(student_detector >= student_threshold, student_severity, 0)
+    teacher_actions = np.where(teacher_detector >= teacher_threshold, teacher_severity_action, 0)
+    action_confusion = np.bincount(
+        teacher_actions * N_CLASSES + student_actions,
+        minlength=N_CLASSES**2,
+    ).reshape(N_CLASSES, N_CLASSES)
+
+    return {
+        "split": "validation",
+        "held_out": False,
+        "detector_probability_mae_all": detector_absolute_error_sum / len(labels),
+        "detector_probability_mae_on_true_positives": detector_absolute_error_positive_sum / n_positive,
+        "detector_bernoulli_kl_teacher_to_student_all": max(0.0, bernoulli_kl_sum / len(labels)),
+        "detector_bernoulli_kl_teacher_to_student_on_true_positives": max(
+            0.0,
+            bernoulli_kl_positive_sum / n_positive,
+        ),
+        "joint_kl_teacher_to_student_all": max(0.0, joint_kl_sum / len(labels)),
+        "joint_kl_teacher_to_student_on_true_positives": max(
+            0.0,
+            joint_kl_positive_sum / n_positive,
+        ),
+        "teacher_positive_weighted_conditional_severity_kl": max(
+            0.0,
+            conditional_kl_weighted_sum / teacher_positive_weight_sum,
+        ),
+        "conditional_severity_top1_agreement_on_true_positives": float(
+            np.mean(student_severity[positive] == teacher_severity_action[positive])
+        ),
+        "independently_thresholded_action_agreement_all": float(np.mean(student_actions == teacher_actions)),
+        "independently_thresholded_action_agreement_on_true_positives": float(
+            np.mean(student_actions[positive] == teacher_actions[positive])
+        ),
+        "teacher_action_student_action_confusion": action_confusion.tolist(),
+    }
+
+
+def _summary(values: list[float]) -> dict[str, float] | None:
+    """Summarize a non-empty list of finite diagnostics."""
+    if not values:
+        return None
+    array = np.asarray(values, dtype=np.float64)
+    return {
+        "min": float(array.min()),
+        "mean": float(array.mean()),
+        "max": float(array.max()),
+    }
+
+
+@torch.inference_mode()
+def member_ensemble_diagnostics(  # noqa: PLR0915
+    model: Student,
+    features: FeatureMatrix,
+    labels: np.ndarray,
+    ensemble_detector: np.ndarray,
+    ensemble_probabilities: np.ndarray,
+    target_recall: float,
+    device: torch.device,
+    batch_size: int,
+) -> dict:
+    """Measure individual member quality and diversity after selection."""
+    model.eval()
+    labels = np.asarray(labels)
+    positive = labels > 0
+    positive_labels = labels[positive]
+    member_scores = np.empty((len(labels), model.k), dtype=np.float32)
+    member_severity = np.empty((len(labels), model.k), dtype=np.int8)
+
+    for start in range(0, len(labels), batch_size):
+        stop = min(start + batch_size, len(labels))
+        if isinstance(features, torch.Tensor):
+            batch_x = features[start:stop]
+        else:
+            batch_x = torch.from_numpy(features[start:stop]).to(device)
+        detector_logits, severity_logits = model.forward_logits(batch_x)
+        member_scores[start:stop] = torch.sigmoid(detector_logits).transpose(0, 1).cpu().numpy()
+        severity = severity_logits.argmax(dim=-1).transpose(0, 1) + 1
+        member_severity[start:stop] = severity.cpu().numpy()
+
+    reconstructed_ensemble = member_scores.mean(axis=1)
+    if not np.allclose(reconstructed_ensemble, ensemble_detector, rtol=1e-5, atol=1e-7):
+        msg = "Individual member probabilities do not reproduce the ensemble detector"
+        raise RuntimeError(msg)
+
+    individual = []
+    member_thresholds = []
+    for member in range(model.k):
+        member_threshold = threshold_at_recall(labels, member_scores[:, member], target_recall)
+        member_thresholds.append(member_threshold)
+        member_actions = np.where(
+            member_scores[:, member] >= member_threshold,
+            member_severity[:, member],
+            0,
+        )
+        individual.append(
+            {
+                "member": member,
+                "detector_ap_full_validation": detection_ap(member_scores[:, member], labels),
+                "detector_threshold_at_target_recall": member_threshold,
+                "conditional_severity_exact_on_true_positives": float(
+                    np.mean(member_severity[positive, member] == positive_labels)
+                ),
+                "equal_recall_action_metrics": halving_action_metrics(
+                    member_actions,
+                    labels,
+                    n_classes=N_CLASSES,
+                ),
+            }
+        )
+
+    subset_size = max(int(positive.sum()), min(len(labels), MEMBER_DIAGNOSTIC_TARGET_ROWS))
+    positive_indices = np.flatnonzero(positive)
+    negative_indices = np.flatnonzero(~positive)
+    n_negative_subset = max(0, subset_size - len(positive_indices))
+    if n_negative_subset == 0:
+        negative_indices = np.empty(0, dtype=np.int64)
+    elif n_negative_subset < len(negative_indices):
+        negative_scores = np.asarray(ensemble_detector)[negative_indices]
+        selected = np.argpartition(negative_scores, -n_negative_subset)[-n_negative_subset:]
+        negative_indices = negative_indices[selected]
+    subset = np.sort(np.concatenate((positive_indices, negative_indices)))
+    subset_scores = member_scores[subset]
+
+    correlations = []
+    undefined_correlations = 0
+    equal_recall_disagreements = []
+    common_threshold_disagreements = []
+    positive_severity_disagreements = []
+    ensemble_threshold = threshold_at_recall(labels, ensemble_detector, target_recall)
+    for first in range(model.k):
+        for second in range(first + 1, model.k):
+            first_scores = subset_scores[:, first]
+            second_scores = subset_scores[:, second]
+            first_float64 = first_scores.astype(np.float64)
+            second_float64 = second_scores.astype(np.float64)
+            first_centered = first_float64 - float(first_float64.mean())
+            second_centered = second_float64 - float(second_float64.mean())
+            denominator = float(
+                np.sqrt(np.dot(first_centered, first_centered) * np.dot(second_centered, second_centered))
+            )
+            if denominator > 0.0:
+                correlation = float(np.dot(first_centered, second_centered) / denominator)
+                correlations.append(float(np.clip(correlation, -1.0, 1.0)))
+            else:
+                undefined_correlations += 1
+            equal_recall_disagreements.append(
+                float(
+                    np.mean((first_scores >= member_thresholds[first]) != (second_scores >= member_thresholds[second]))
+                )
+            )
+            common_threshold_disagreements.append(
+                float(np.mean((first_scores >= ensemble_threshold) != (second_scores >= ensemble_threshold)))
+            )
+            positive_severity_disagreements.append(
+                float(np.mean(member_severity[positive, first] != member_severity[positive, second]))
+            )
+
+    individual_aps = [entry["detector_ap_full_validation"] for entry in individual]
+    ensemble_ap = detection_ap(ensemble_detector, labels)
+    ensemble_severity = ensemble_probabilities[:, 1:].argmax(axis=1) + 1
+    return {
+        "split": "validation",
+        "held_out": False,
+        "target_recall": target_recall,
+        "individual_action_policy": "each member's highest threshold achieving target recall",
+        "individual_members": individual,
+        "ensemble": {
+            "detector_ap_full_validation": ensemble_ap,
+            "conditional_severity_exact_on_true_positives": float(
+                np.mean(ensemble_severity[positive] == positive_labels)
+            ),
+            "ap_gain_over_mean_member": ensemble_ap - float(np.mean(individual_aps)),
+            "ap_gain_over_best_member": ensemble_ap - max(individual_aps),
+        },
+        "diversity_subset": {
+            "policy": MEMBER_DIAGNOSTIC_SUBSET_POLICY,
+            "target_rows": MEMBER_DIAGNOSTIC_TARGET_ROWS,
+            "rows": len(subset),
+            "positive_rows": int(positive[subset].sum()),
+            "negative_rows": int((~positive[subset]).sum()),
+            "pair_count": model.k * (model.k - 1) // 2,
+            "detector_score_pearson": _summary(correlations),
+            "detector_score_pearson_undefined_pairs": undefined_correlations,
+            "equal_recall_binary_disagreement": _summary(equal_recall_disagreements),
+            "common_ensemble_threshold_binary_disagreement": _summary(common_threshold_disagreements),
+            "positive_conditional_severity_disagreement": _summary(positive_severity_disagreements),
+        },
+    }
 
 
 def evaluate_model(
@@ -812,7 +1259,7 @@ def epsilon_policy_diagnostic(
         "probability_interpretation": (
             "population-prior-corrected model scores; empirical calibration has not been established"
         ),
-        "selected_on": "same validation period used for checkpoint selection",
+        "selected_on": ("same validation period, fitted only after threshold-free probabilistic checkpoint selection"),
         "reporting_status": "optimistic development diagnostic, not held-out performance",
         "max_action": WEEK_MAX_ACTION,
         "action_domain": list(range(WEEK_MAX_ACTION + 1)),
@@ -880,18 +1327,50 @@ def _validate_args(args: argparse.Namespace) -> None:
             raise ValueError(msg)
 
     _validate_model_args(args)
-    if args.lr <= 0.0 or args.weight_decay < 0.0:
+    if not np.isfinite(args.lr) or not np.isfinite(args.weight_decay) or args.lr <= 0.0 or args.weight_decay < 0.0:
         msg = "lr must be positive and weight-decay must be non-negative"
         raise ValueError(msg)
-    if args.alpha < 0.0 or args.beta < 0.0:
+    if not all(np.isfinite(value) for value in (args.alpha, args.beta, args.lambda_sev)) or any(
+        value < 0.0 for value in (args.alpha, args.beta, args.lambda_sev)
+    ):
         msg = "distillation weights must be non-negative"
+        raise ValueError(msg)
+    if not np.isfinite(args.kd_temperature) or args.kd_temperature <= 0.0:
+        msg = "kd-temperature must be finite and positive"
         raise ValueError(msg)
     if not 0.0 < args.target_recall <= 1.0:
         msg = "target-recall must be in (0, 1]"
         raise ValueError(msg)
+    if args.seed < 0:
+        msg = "seed must be non-negative"
+        raise ValueError(msg)
+    if args.epochs >= EPOCH_SEED_STRIDE:
+        msg = f"epochs must be below {EPOCH_SEED_STRIDE} for collision-free sampling seeds"
+        raise ValueError(msg)
     if args.device == "cuda" and not torch.cuda.is_available():
         msg = "CUDA was requested but is not available"
         raise RuntimeError(msg)
+
+
+def _validate_teacher_cache(
+    margin: np.ndarray,
+    severity: np.ndarray,
+    n_rows: int,
+    split: str,
+) -> None:
+    """Validate one pair of cached teacher-response arrays."""
+    if margin.shape != (n_rows,):
+        msg = f"{split} teacher margin cache has the wrong shape"
+        raise ValueError(msg)
+    if severity.shape != (n_rows, N_SEVERITY_CLASSES):
+        msg = f"{split} teacher severity cache has the wrong shape"
+        raise ValueError(msg)
+    if not np.isfinite(margin).all() or not np.isfinite(severity).all():
+        msg = f"{split} teacher caches must contain finite values"
+        raise ValueError(msg)
+    if np.any(severity < 0.0) or np.any(severity.sum(axis=1) <= 0.0):
+        msg = f"{split} teacher severity rows must contain non-negative positive mass"
+        raise ValueError(msg)
 
 
 def _validate_cache_shapes(
@@ -899,8 +1378,10 @@ def _validate_cache_shapes(
     train_y: np.ndarray,
     val_x: np.ndarray,
     val_y: np.ndarray,
-    teacher_margin: np.ndarray | None,
-    teacher_severity: np.ndarray | None,
+    train_teacher_margin: np.ndarray | None,
+    train_teacher_severity: np.ndarray | None,
+    val_teacher_margin: np.ndarray,
+    val_teacher_severity: np.ndarray,
 ) -> None:
     """Check the inexpensive cache-shape invariants needed for training."""
     if train_x.ndim != MATRIX_NDIM or val_x.ndim != MATRIX_NDIM:
@@ -921,24 +1402,36 @@ def _validate_cache_shapes(
     if train_x.shape[1] != val_x.shape[1]:
         msg = "Training and validation caches have different feature counts"
         raise ValueError(msg)
-    if (teacher_margin is None) != (teacher_severity is None):
-        msg = "Teacher margin and severity caches must both be present"
+    if (train_teacher_margin is None) != (train_teacher_severity is None):
+        msg = "Training teacher margin and severity caches must both be present"
         raise ValueError(msg)
-    if teacher_margin is not None and teacher_severity is not None:
-        if teacher_margin.shape != (len(train_y),):
-            msg = "Teacher margin cache has the wrong shape"
-            raise ValueError(msg)
-        if teacher_severity.shape != (len(train_y), N_SEVERITY_CLASSES):
-            msg = "Teacher severity cache has the wrong shape"
-            raise ValueError(msg)
+    if train_teacher_margin is not None and train_teacher_severity is not None:
+        _validate_teacher_cache(
+            train_teacher_margin,
+            train_teacher_severity,
+            len(train_y),
+            "Training",
+        )
+    _validate_teacher_cache(
+        val_teacher_margin,
+        val_teacher_severity,
+        len(val_y),
+        "Validation",
+    )
 
 
 def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
     """Execute training loop with early stopping."""
     # Preserve programmatic callers created before cache placement became a
     # configurable command-line option.
-    if not hasattr(args, "cache_residency"):
-        args.cache_residency = DEFAULT_CACHE_RESIDENCY
+    backward_compatible_defaults = {
+        "cache_residency": DEFAULT_CACHE_RESIDENCY,
+        "lambda_sev": DEFAULT_LAMBDA_SEV,
+        "kd_temperature": DEFAULT_KD_TEMPERATURE,
+    }
+    for name, default in backward_compatible_defaults.items():
+        if not hasattr(args, name):
+            setattr(args, name, default)
     _validate_args(args)
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
@@ -959,13 +1452,18 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
     print(f"Train: {train_x_host.shape}, {train_x_host.nbytes / 2**20:.1f} MiB (resident)")
     print(f"Val: {val_x_host.shape}, {val_x_host.nbytes / 2**20:.1f} MiB (resident)")
 
-    # Load teacher targets if distilling
-    teacher_margin = None
-    teacher_severity = None
+    # Validation responses are loaded for both controls so teacher fidelity and
+    # student agreement are directly comparable. Training responses are needed
+    # only by distilled cells.
+    train_teacher_margin = None
+    train_teacher_severity = None
     if args.distill:
-        print("Loading teacher targets...", flush=True)
-        teacher_margin = _load_array_resident(cache_dir / "train_teacher_margin.npy")
-        teacher_severity = _load_array_resident(cache_dir / "train_teacher_severity.npy")
+        print("Loading training teacher targets...", flush=True)
+        train_teacher_margin = _load_array_resident(cache_dir / "train_teacher_margin.npy")
+        train_teacher_severity = _load_array_resident(cache_dir / "train_teacher_severity.npy")
+    print("Loading validation teacher targets...", flush=True)
+    val_teacher_margin = _load_array_resident(cache_dir / "val_teacher_margin.npy")
+    val_teacher_severity = _load_array_resident(cache_dir / "val_teacher_severity.npy")
 
     cache_load_seconds = time.perf_counter() - cache_load_start
     print(f"Cache loaded into host RAM in {cache_load_seconds:.1f}s", flush=True)
@@ -975,8 +1473,10 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         train_y,
         val_x_host,
         val_y,
-        teacher_margin,
-        teacher_severity,
+        train_teacher_margin,
+        train_teacher_severity,
+        val_teacher_margin,
+        val_teacher_severity,
     )
 
     metadata_path = cache_dir / "metadata.json"
@@ -1003,7 +1503,10 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         args.negative_ratio * n_positives,
     )
     delta_s = float(np.log(n_negatives_full / n_negatives_sampled))
+    population_prevalence = n_positives / (n_positives + n_negatives_full)
+    initial_detector_bias = float(np.log(n_positives / n_negatives_full))
     print(f"Student delta_S: {delta_s:.4f}")
+    print(f"Initial detector population log-odds: {initial_detector_bias:.4f}")
 
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -1025,7 +1528,9 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         k=args.members,
         dropout=args.dropout,
         architecture=args.architecture,
-    ).to(device)
+    )
+    model.initialize_detector_bias(initial_detector_bias)
+    model = model.to(device)
 
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
@@ -1043,6 +1548,38 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         "trainable_parameters": trainable_params,
         "cache_residency": cache_residency,
     }
+    training_protocol = {
+        "negative_sampling": {
+            "policy": "uniform random undersampling without replacement per epoch",
+            "epoch_seed_policy": SAMPLING_SEED_POLICY,
+            "epoch_seed_stride": EPOCH_SEED_STRIDE,
+            "full_negative_rows": n_negatives_full,
+            "sampled_negative_rows_per_epoch": n_negatives_sampled,
+            "positive_rows_per_epoch": n_positives,
+            "negative_to_positive_ratio": args.negative_ratio,
+            "population_prior_correction_delta_s": delta_s,
+        },
+        "detector_bias_initialization": {
+            "policy": DETECTOR_BIAS_POLICY,
+            "value": initial_detector_bias,
+            "positive_rows": n_positives,
+            "negative_rows": n_negatives_full,
+            "population_prevalence": population_prevalence,
+        },
+    }
+    objective = {
+        "version": "dual-head-response-kd-v2",
+        "distill": args.distill,
+        "hard_detector": "population-margin BCE with sampled-prior shift",
+        "hard_severity": "conditional cross entropy on true-positive rows",
+        "detector_kd": "population-margin SmoothL1",
+        "severity_kd": "temperature-scaled conditional KL gated by teacher positive probability",
+        "alpha": args.alpha,
+        "beta": args.beta,
+        "lambda_sev": args.lambda_sev,
+        "kd_temperature": args.kd_temperature,
+        "loss_component_reporting": "weighted mean per optimizer batch",
+    }
 
     # Optimizer
     optimizer = torch.optim.AdamW(
@@ -1054,7 +1591,6 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
     # Training loop
     best_selection_key = None
     best_epoch = None
-    best_threshold = None
     patience_counter = 0
     best_state = None
     best_probabilities = None
@@ -1069,7 +1605,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
     print(f"Evaluation batch size: {args.eval_batch_size}")
     print(f"Feature cache residency: {cache_residency}")
     print(f"Negative ratio: {args.negative_ratio}")
-    print(f"Target detector recall: {args.target_recall:.1%}")
+    print(f"Post-checkpoint target detector recall: {args.target_recall:.1%}")
     print(f"Checkpoint policy: {SELECTION_POLICY}")
 
     for epoch in range(1, args.epochs + 1):
@@ -1077,16 +1613,18 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
 
-        # Use different seed each epoch for negative sampling
-        epoch_seed = args.seed + epoch
+        # Architecture/KD cells with the same run seed see identical samples;
+        # different run seeds use disjoint RNG streams rather than shifted
+        # copies of the same epoch sequence.
+        epoch_seed = args.seed * EPOCH_SEED_STRIDE + epoch
 
         train_result = train_epoch(
             model,
             optimizer,
             train_x,
             train_y,
-            teacher_margin,
-            teacher_severity,
+            train_teacher_margin,
+            train_teacher_severity,
             device,
             args.batch_size,
             args.negative_ratio,
@@ -1094,6 +1632,8 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
             delta_s,
             args.alpha,
             args.beta,
+            lambda_sev=args.lambda_sev,
+            kd_temperature=args.kd_temperature,
             positive_indices=positive_indices,
             negative_indices=negative_indices,
             return_details=True,
@@ -1113,39 +1653,29 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         )
         inference_seconds = time.perf_counter() - inference_start
         metrics_start = time.perf_counter()
-        val_metrics = evaluate(
-            val_probabilities,
-            val_y,
-            target_recall=args.target_recall,
-            detection_outputs=val_detector_probability,
-            include_diagnostics=False,
-        )
+        probability = probability_metrics(val_probabilities, val_y)
+        val_ap = detection_ap(val_detector_probability, val_y)
+        val_metrics = {"ap": val_ap, "probability": probability}
         metrics_seconds = time.perf_counter() - metrics_start
-        val_ap = float(val_metrics["ap"])
-        severity_metrics = val_metrics["severity"]
-        val_exact = float(severity_metrics["exact_on_positive"])
-        val_overprediction_rate = float(severity_metrics["overprediction_rate_all"])
-        achieved_recall = float(val_metrics["recall"])
         selection_key = checkpoint_selection_key(val_metrics)
-        selected_threshold = float(val_metrics["threshold"])
+        val_rps = float(probability["ranked_probability_score"])
+        val_nll = float(probability["negative_log_likelihood"])
+        val_brier = float(probability["brier_score"])
 
         if not all(
             np.isfinite(value)
             for value in (
                 train_loss,
                 val_ap,
-                val_exact,
-                val_overprediction_rate,
-                achieved_recall,
-                selected_threshold,
+                val_rps,
+                val_nll,
+                val_brier,
+                *train_result.loss_components.values(),
             )
         ):
             msg = (
                 f"Non-finite value at epoch {epoch}: loss={train_loss}, "
-                f"val_ap={val_ap}, exact={val_exact}, "
-                f"overprediction_rate={val_overprediction_rate}, "
-                f"recall={achieved_recall}, "
-                f"threshold={selected_threshold}"
+                f"val_rps={val_rps}, val_nll={val_nll}, val_ap={val_ap}"
             )
             raise FloatingPointError(msg)
 
@@ -1155,16 +1685,13 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         history.append(
             {
                 "epoch": epoch,
+                "sampling_seed": epoch_seed,
                 "training_loss": float(train_loss),
+                "training_loss_components_weighted": train_result.loss_components,
                 "validation_ap": val_ap,
-                "achieved_recall": achieved_recall,
-                "exact_on_positive": val_exact,
-                "exact_on_positive_count": int(severity_metrics["exact_on_positive_count"]),
-                "overprediction_count_all": int(severity_metrics["overprediction_count_all"]),
-                "overprediction_rate_all": val_overprediction_rate,
-                "overprediction_level_sum_all": int(severity_metrics["overprediction_level_sum_all"]),
-                "underprediction_level_sum_all": int(severity_metrics["underprediction_level_sum_all"]),
-                "threshold": selected_threshold,
+                "validation_ranked_probability_score": val_rps,
+                "validation_negative_log_likelihood": val_nll,
+                "validation_brier_score": val_brier,
                 "selection_key": list(selection_key),
                 "seconds": epoch_time,
                 "sampled_rows": train_result.sampled_rows,
@@ -1181,21 +1708,26 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
 
         print(
             f"Epoch {epoch:3d} | loss {train_loss:.4f} | "
-            f"exact+ {val_exact:.4f} | over(all) {val_overprediction_rate:.6f} | "
-            f"recall {achieved_recall:.4f} | AP {val_ap:.4f} | "
-            f"threshold {selected_threshold:.6g} | "
+            f"RPS {val_rps:.6g} | NLL {val_nll:.6g} | AP {val_ap:.4f} | "
             f"time {epoch_time:.1f}s "
             f"(stage {train_result.staging_seconds:.1f}s, "
             f"train {train_result.optimization_seconds:.1f}s, "
             f"infer {inference_seconds:.1f}s, metrics {metrics_seconds:.1f}s, "
             f"GPU peak {gpu_peak_allocated_mib / 1024:.1f} GiB)"
         )
+        loss_parts = train_result.loss_components
+        print(
+            "  weighted loss components | "
+            f"hard detector {loss_parts['hard_detector']:.5f} | "
+            f"hard severity {loss_parts['hard_severity']:.5f} | "
+            f"KD detector {loss_parts['kd_detector']:.5f} | "
+            f"KD severity {loss_parts['kd_severity']:.5f}"
+        )
 
         # Early stopping
         if best_selection_key is None or selection_key > best_selection_key:
             best_selection_key = selection_key
             best_epoch = epoch
-            best_threshold = selected_threshold
             patience_counter = 0
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             best_probabilities = val_probabilities
@@ -1211,7 +1743,6 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         best_state is None
         or best_selection_key is None
         or best_epoch is None
-        or best_threshold is None
         or best_probabilities is None
         or best_detector_probability is None
     ):
@@ -1224,21 +1755,19 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
     ):
         msg = "Loaded model state does not match the selected checkpoint"
         raise RuntimeError(msg)
-    threshold_source = "selected with checkpoint on validation set"
+    threshold_source = "selected after probabilistic checkpoint selection on validation set"
     final_probabilities = best_probabilities
     final_detector_probability = best_detector_probability
     final_metrics = evaluate(
         final_probabilities,
         val_y,
-        threshold=best_threshold,
         target_recall=args.target_recall,
         threshold_source=threshold_source,
         detection_outputs=final_detector_probability,
     )
+    best_threshold = float(final_metrics["threshold"])
     final_selection_key = checkpoint_selection_key(final_metrics)
-    integer_key_matches = final_selection_key[:-1] == best_selection_key[:-1]
-    ap_matches = np.isclose(final_selection_key[-1], best_selection_key[-1])
-    if not integer_key_matches or not ap_matches:
+    if not np.allclose(final_selection_key, best_selection_key, rtol=1e-12, atol=1e-15):
         msg = "Cached selected-epoch predictions do not reproduce their validation selection key"
         raise RuntimeError(msg)
     if final_metrics["recall"] + np.finfo(float).eps < args.target_recall:
@@ -1247,22 +1776,61 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
 
     selection = {
         "policy": SELECTION_POLICY,
-        "threshold_rule": THRESHOLD_RULE,
-        "threshold_score": THRESHOLD_SCORE,
-        "target_recall": args.target_recall,
+        "split": "validation",
+        "uses_hard_actions": False,
+        "prevalence_weighting": "natural validation prevalence; no class weighting",
         "criteria": list(SELECTION_CRITERIA),
         "best_epoch": best_epoch,
         "best_key": list(best_selection_key),
-        "threshold": best_threshold,
-        "achieved_recall": float(final_metrics["recall"]),
+        "selected_checkpoint_ranked_probability_score": float(final_metrics["probability"]["ranked_probability_score"]),
+        "selected_checkpoint_negative_log_likelihood": float(final_metrics["probability"]["negative_log_likelihood"]),
+        "selected_checkpoint_brier_score": float(final_metrics["probability"]["brier_score"]),
         "selected_checkpoint_ap": float(final_metrics["ap"]),
+        "min_rps_observed": min(row["validation_ranked_probability_score"] for row in history),
+        "min_nll_observed": min(row["validation_negative_log_likelihood"] for row in history),
         "max_ap_observed": max(row["validation_ap"] for row in history),
     }
+    threshold_policy = {
+        "rule": THRESHOLD_RULE,
+        "score": THRESHOLD_SCORE,
+        "split": "validation",
+        "selected_after_checkpoint": True,
+        "target_recall": args.target_recall,
+        "threshold": best_threshold,
+        "achieved_recall": float(final_metrics["recall"]),
+    }
+    diagnostics_start = time.perf_counter()
+    teacher_validation = teacher_validation_diagnostics(
+        val_teacher_margin,
+        val_teacher_severity,
+        val_y,
+        args.target_recall,
+    )
+    teacher_agreement = student_teacher_agreement(
+        final_probabilities,
+        final_detector_probability,
+        val_teacher_margin,
+        val_teacher_severity,
+        val_y,
+        best_threshold,
+        float(teacher_validation["metrics"]["threshold"]),
+    )
+    member_diagnostics = member_ensemble_diagnostics(
+        model,
+        val_x,
+        val_y,
+        final_detector_probability,
+        final_probabilities,
+        args.target_recall,
+        device,
+        args.eval_batch_size,
+    )
     policy_diagnostic = epsilon_policy_diagnostic(
         final_probabilities,
         val_y,
         args.target_recall,
     )
+    final_diagnostics_seconds = time.perf_counter() - diagnostics_start
 
     # Save results
     task = "distilled" if args.distill else "supervised"
@@ -1283,6 +1851,14 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
             "target_recall": args.target_recall,
             "severity_decision": SEVERITY_DECISION,
             "selection": selection,
+            "threshold_policy": threshold_policy,
+            "objective": objective,
+            "training_protocol": training_protocol,
+            "diagnostic_protocol": {
+                "teacher_validation_targets": "required for all supervised and distilled cells",
+                "member_diagnostics": "full-validation AP/action metrics plus hard-subset diversity",
+                "epsilon_policy": EPSILON_POLICY_VERSION,
+            },
         },
         model_path,
     )
@@ -1293,12 +1869,18 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         "seed": args.seed,
         "config": vars(args),
         "model": model_metadata,
+        "objective": objective,
+        "training_protocol": training_protocol,
         "metrics": final_metrics,
         "threshold": best_threshold,
         "threshold_source": threshold_source,
         "target_recall": args.target_recall,
         "severity_decision": SEVERITY_DECISION,
         "selection": selection,
+        "threshold_policy": threshold_policy,
+        "teacher_validation": teacher_validation,
+        "student_teacher_agreement": teacher_agreement,
+        "member_ensemble_diagnostics": member_diagnostics,
         "epsilon_policy_diagnostic": policy_diagnostic,
         "history": history,
         "performance": {
@@ -1306,6 +1888,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
             "index_pool_seconds": pool_seconds,
             "feature_staging_seconds": feature_staging_seconds,
             "cache_residency": cache_residency,
+            "final_diagnostics_seconds": final_diagnostics_seconds,
             "max_gpu_allocated_mib": max(row["gpu_peak_allocated_mib"] for row in history),
             "max_gpu_reserved_mib": max(row["gpu_peak_reserved_mib"] for row in history),
         },
@@ -1315,10 +1898,31 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
     print(f"\nSaved model: {model_path}")
     print(f"Saved results: {result_path}")
     print(f"Final AP: {final_metrics['ap']:.4f}")
+    print(
+        "Final proper scores: "
+        f"RPS {final_metrics['probability']['ranked_probability_score']:.6g} | "
+        f"NLL {final_metrics['probability']['negative_log_likelihood']:.6g}"
+    )
     print(f"Best epoch: {best_epoch}")
     print(f"Frozen threshold: {best_threshold:.6g}")
     print(f"Exact on positives: {final_metrics['severity']['exact_on_positive']:.4f}")
     print(f"All-row overprediction rate: {final_metrics['severity']['overprediction_rate_all']:.6f}")
+    print(
+        "Cached teacher validation: "
+        f"AP {teacher_validation['detector_ap']:.6f} | "
+        "conditional severity exact "
+        f"{teacher_validation['conditional_severity_exact_on_true_positives']:.4f}"
+    )
+    print(
+        "Student/teacher agreement: "
+        f"joint KL {teacher_agreement['joint_kl_teacher_to_student_all']:.6g} | "
+        "positive severity agreement "
+        f"{teacher_agreement['conditional_severity_top1_agreement_on_true_positives']:.4f}"
+    )
+    print(
+        "Member ensemble diagnostic: "
+        f"AP gain over mean member {member_diagnostics['ensemble']['ap_gain_over_mean_member']:.6g}"
+    )
     reference_policy = policy_diagnostic["reference_policy"]
     print(
         "ASAD policy diagnostic: "
@@ -1391,6 +1995,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--distill", action="store_true", help="Use knowledge distillation")
     parser.add_argument("--alpha", type=float, default=1.0, help="Detector distillation weight")
     parser.add_argument("--beta", type=float, default=0.5, help="Severity distillation weight")
+    parser.add_argument(
+        "--lambda-sev",
+        type=float,
+        default=DEFAULT_LAMBDA_SEV,
+        help="Hard-label conditional-severity loss weight",
+    )
+    parser.add_argument(
+        "--kd-temperature",
+        type=float,
+        default=DEFAULT_KD_TEMPERATURE,
+        help="Conditional-severity KD temperature (detector margin KD is untempered)",
+    )
 
     # Misc
     parser.add_argument(

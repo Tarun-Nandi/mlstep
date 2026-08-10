@@ -17,6 +17,7 @@ TOP_FRACTION = 0.001
 PROBABILITY_NDIM = 2  # a probability matrix is two dimensional: (rows, classes)
 BINARY_COLUMNS = 2  # more columns than this means genuine multiclass output
 BOUNDARY_TOLERANCE = 1e-12
+PROBABILITY_METRIC_CHUNK_ROWS = 1_000_000
 
 
 def detection_scores(outputs: np.ndarray) -> np.ndarray:
@@ -39,6 +40,64 @@ def detection_ap(outputs: np.ndarray, targets: np.ndarray) -> float:
         return 0.0
     # Convert the physical labels into a binary target
     return float(average_precision_score(positive, detection_scores(outputs)))
+
+
+def probability_metrics(probabilities: np.ndarray, targets: np.ndarray) -> dict[str, float]:
+    """Evaluate a full ordinal class distribution with proper scores.
+
+    The ranked probability score is averaged over the ``n_classes - 1``
+    cumulative class boundaries, so it remains on a comparable scale when the
+    number of supported actions changes. All reductions use float64 and are
+    chunked to avoid large temporary matrices for the week validation split.
+    """
+    probabilities = validate_probabilities(probabilities)
+    targets = np.asarray(targets)
+    if targets.ndim != 1 or len(targets) != len(probabilities):
+        msg = "targets must be a one-dimensional array matching probabilities"
+        raise ValueError(msg)
+    if np.iscomplexobj(targets) or not np.issubdtype(targets.dtype, np.number) or not np.isfinite(targets).all():
+        msg = "targets must contain finite numeric values"
+        raise ValueError(msg)
+    integer_targets = targets.astype(np.int64, copy=False)
+    if not np.array_equal(targets, integer_targets):
+        msg = "targets must contain integer class labels"
+        raise ValueError(msg)
+
+    n_rows, n_classes = probabilities.shape
+    if n_classes < BINARY_COLUMNS:
+        msg = "probabilities must contain at least two classes"
+        raise ValueError(msg)
+    if integer_targets.min() < 0 or integer_targets.max() >= n_classes:
+        msg = f"targets must be between 0 and {n_classes - 1}"
+        raise ValueError(msg)
+
+    nll_sum = 0.0
+    brier_sum = 0.0
+    rps_sum = 0.0
+    boundaries = np.arange(n_classes - 1, dtype=np.int64)
+    tiny = np.finfo(np.float64).tiny
+
+    for start in range(0, n_rows, PROBABILITY_METRIC_CHUNK_ROWS):
+        stop = min(start + PROBABILITY_METRIC_CHUNK_ROWS, n_rows)
+        chunk = probabilities[start:stop].astype(np.float64, copy=False)
+        chunk_targets = integer_targets[start:stop]
+        row_indices = np.arange(stop - start)
+        true_probability = chunk[row_indices, chunk_targets]
+        nll_sum -= float(np.log(np.maximum(true_probability, tiny)).sum())
+
+        # ||q - one_hot(y)||^2 = sum(q^2) - 2 q_y + 1.
+        brier_sum += float((np.square(chunk).sum(axis=1) - 2.0 * true_probability + 1.0).sum())
+
+        cumulative = np.cumsum(chunk[:, :-1], axis=1, dtype=np.float64)
+        observed_cumulative = chunk_targets[:, None] <= boundaries
+        np.subtract(cumulative, observed_cumulative, out=cumulative)
+        rps_sum += float(np.square(cumulative).sum())
+
+    return {
+        "negative_log_likelihood": nll_sum / n_rows,
+        "brier_score": brier_sum / n_rows,
+        "ranked_probability_score": rps_sum / (n_rows * (n_classes - 1)),
+    }
 
 
 def threshold_at_recall(targets: np.ndarray, scores: np.ndarray, target_recall: float) -> float:
@@ -159,6 +218,7 @@ def evaluate(
         metrics.update(_ranking_diagnostics(targets, scores, positive, n_positive, selected_here))
     # Some more optinal multiclass metrics
     if outputs.ndim == PROBABILITY_NDIM and outputs.shape[1] > BINARY_COLUMNS:
+        metrics["probability"] = probability_metrics(outputs, targets)
         metrics["severity"] = exact_halvings_metrics(outputs, targets, detected)
 
     return metrics
