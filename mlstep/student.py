@@ -52,7 +52,7 @@ MATRIX_NDIM: Final = 2
 N_SEVERITY_CLASSES: Final = N_CLASSES - 1
 
 # Training defaults
-DEFAULT_EPOCHS: Final = 80
+DEFAULT_EPOCHS: Final = 120
 DEFAULT_PATIENCE: Final = 12
 DEFAULT_BATCH_SIZE: Final = 1024
 DEFAULT_EVAL_BATCH_SIZE: Final = 65536
@@ -61,6 +61,8 @@ DEFAULT_TARGET_RECALL: Final = 0.97
 CACHE_RESIDENCIES: Final = ("auto", "host", "cuda")
 DEFAULT_CACHE_RESIDENCY: Final = "auto"
 DEFAULT_LAMBDA_SEV: Final = 0.1
+DEFAULT_ALPHA: Final = 1.0
+DEFAULT_BETA: Final = 0.1
 DEFAULT_KD_TEMPERATURE: Final = 1.0
 GPU_DATA_RESERVE_BYTES: Final = 16 * 2**30
 LOAD_CHUNK_BYTES: Final = 512 * 2**20
@@ -91,6 +93,15 @@ SELECTION_CRITERIA: Final = (
     "maximize detector average precision",
 )
 SEVERITY_DECISION: Final = "argmax conditional severity probability"
+
+# This optional checkpoint is a ranking diagnostic only. It never participates
+# in early stopping, threshold selection, or the canonical final diagnostics.
+AP_SELECTION_POLICY: Final = "detector-ap-rps-nll-diagnostic-v1"
+AP_SELECTION_CRITERIA: Final = (
+    "maximize detector average precision",
+    "minimize probability.ranked_probability_score (tie-breaker)",
+    "minimize probability.negative_log_likelihood (tie-breaker)",
+)
 
 # Development-only ASAD policy diagnostic. These probabilities are not yet
 # calibrated on an independent chronological block, so no epsilon is selected
@@ -321,8 +332,8 @@ def compute_loss(
     teacher_margin: torch.Tensor | None = None,
     teacher_severity: torch.Tensor | None = None,
     delta_s: float = 0.0,
-    alpha: float = 1.0,
-    beta: float = 0.5,
+    alpha: float = DEFAULT_ALPHA,
+    beta: float = DEFAULT_BETA,
     lambda_sev: float = DEFAULT_LAMBDA_SEV,
     has_positive: bool | None = None,
     kd_temperature: float = DEFAULT_KD_TEMPERATURE,
@@ -330,9 +341,9 @@ def compute_loss(
 ) -> torch.Tensor | tuple[torch.Tensor, LossBreakdown]:
     """Compute hard-label and optional response-distillation losses.
 
-    Temperature applies to the conditional severity distributions only. The
-    teacher detector probability remains an untempered relevance gate, and
-    ``kd_temperature=1`` reproduces the original objective.
+    Temperature applies to both response-distillation terms. The teacher
+    detector probability used as the conditional-severity relevance weight
+    remains untempered.
     """
     n_members = d_logit.shape[0]
     if not np.isfinite(kd_temperature) or kd_temperature <= 0.0:
@@ -382,10 +393,16 @@ def compute_loss(
     if teacher_margin is not None and teacher_severity is not None:
         teacher_margin_members = teacher_margin.unsqueeze(0).expand_as(d_logit)
 
-        # Both are population-scale margins.
-        margin_loss = F.smooth_l1_loss(
-            d_logit,
-            teacher_margin_members,
+        # Both are population-scale margins. Distil their Bernoulli responses
+        # instead of matching arbitrary logit magnitude in the far-negative
+        # tail. The T^2 factor retains the standard temperature scaling.
+        teacher_detector_target = torch.sigmoid(teacher_margin_members / kd_temperature)
+        detector_kd_loss = (
+            F.binary_cross_entropy_with_logits(
+                d_logit / kd_temperature,
+                teacher_detector_target,
+            )
+            * kd_temperature**2
         )
 
         # At T=1 this is exactly the original conditional-severity KD target.
@@ -410,10 +427,14 @@ def compute_loss(
             reduction="none",
         ).sum(dim=-1)
 
-        teacher_detection_probability = torch.sigmoid(teacher_margin).unsqueeze(0)
-        severity_kl = (teacher_detection_probability * severity_kl).mean() * kd_temperature**2
+        # Average member KLs first so the objective is invariant to K, then
+        # normalize by the teacher-positive mass represented in this batch.
+        teacher_detection_probability = torch.sigmoid(teacher_margin)
+        severity_kl = severity_kl.mean(dim=0)
+        positive_mass = teacher_detection_probability.sum().clamp_min(torch.finfo(severity_kl.dtype).tiny)
+        severity_kl = (teacher_detection_probability * severity_kl).sum() / positive_mass * kd_temperature**2
 
-        kd_detector = alpha * margin_loss
+        kd_detector = alpha * detector_kd_loss
         kd_severity = beta * severity_kl
 
     total_loss = hard_detector + hard_severity + kd_detector + kd_severity
@@ -439,6 +460,20 @@ def checkpoint_selection_key(metrics: dict) -> tuple[float, float, float]:
         -float(probability["ranked_probability_score"]),
         -float(probability["negative_log_likelihood"]),
         float(metrics["ap"]),
+    )
+
+
+def ap_checkpoint_selection_key(metrics: dict) -> tuple[float, float, float]:
+    """Return the AP-first diagnostic checkpoint key; larger is better."""
+    probability = metrics.get("probability")
+    if probability is None:
+        msg = "AP checkpoint selection requires joint probability metrics"
+        raise ValueError(msg)
+
+    return (
+        float(metrics["ap"]),
+        -float(probability["ranked_probability_score"]),
+        -float(probability["negative_log_likelihood"]),
     )
 
 
@@ -1428,6 +1463,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         "cache_residency": DEFAULT_CACHE_RESIDENCY,
         "lambda_sev": DEFAULT_LAMBDA_SEV,
         "kd_temperature": DEFAULT_KD_TEMPERATURE,
+        "save_ap_best_checkpoint": False,
     }
     for name, default in backward_compatible_defaults.items():
         if not hasattr(args, name):
@@ -1568,12 +1604,13 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         },
     }
     objective = {
-        "version": "dual-head-response-kd-v2",
+        "version": "dual-head-response-kd-v3",
         "distill": args.distill,
         "hard_detector": "population-margin BCE with sampled-prior shift",
         "hard_severity": "conditional cross entropy on true-positive rows",
-        "detector_kd": "population-margin SmoothL1",
-        "severity_kd": "temperature-scaled conditional KL gated by teacher positive probability",
+        "detector_kd": ("T^2 * BCEWithLogits(student population margin / T, sigmoid(teacher population margin / T))"),
+        "severity_kd": ("T^2 * teacher-positive-mass-normalized conditional KL, averaged over ensemble members"),
+        "severity_kd_teacher_gate": "untempered sigmoid of teacher population margin",
         "alpha": args.alpha,
         "beta": args.beta,
         "lambda_sev": args.lambda_sev,
@@ -1595,6 +1632,9 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
     best_state = None
     best_probabilities = None
     best_detector_probability = None
+    best_ap_selection_key = None
+    best_ap_epoch = None
+    best_ap_state = None
     history = []
 
     print(f"\nTraining for {args.epochs} epochs with patience {args.patience}")
@@ -1607,6 +1647,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
     print(f"Negative ratio: {args.negative_ratio}")
     print(f"Post-checkpoint target detector recall: {args.target_recall:.1%}")
     print(f"Checkpoint policy: {SELECTION_POLICY}")
+    print(f"Save AP-best diagnostic checkpoint: {args.save_ap_best_checkpoint}")
 
     for epoch in range(1, args.epochs + 1):
         epoch_start = time.perf_counter()
@@ -1658,6 +1699,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         val_metrics = {"ap": val_ap, "probability": probability}
         metrics_seconds = time.perf_counter() - metrics_start
         selection_key = checkpoint_selection_key(val_metrics)
+        ap_selection_key = ap_checkpoint_selection_key(val_metrics)
         val_rps = float(probability["ranked_probability_score"])
         val_nll = float(probability["negative_log_likelihood"])
         val_brier = float(probability["brier_score"])
@@ -1693,6 +1735,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
                 "validation_negative_log_likelihood": val_nll,
                 "validation_brier_score": val_brier,
                 "selection_key": list(selection_key),
+                "ap_selection_key": list(ap_selection_key),
                 "seconds": epoch_time,
                 "sampled_rows": train_result.sampled_rows,
                 "training_batches": train_result.batches,
@@ -1724,6 +1767,14 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
             f"KD severity {loss_parts['kd_severity']:.5f}"
         )
 
+        # AP is tracked independently for an opt-in ranking diagnostic. It
+        # does not affect canonical early stopping or any final metrics.
+        if best_ap_selection_key is None or ap_selection_key > best_ap_selection_key:
+            best_ap_selection_key = ap_selection_key
+            best_ap_epoch = epoch
+            if args.save_ap_best_checkpoint:
+                best_ap_state = {name: value.cpu().clone() for name, value in model.state_dict().items()}
+
         # Early stopping
         if best_selection_key is None or selection_key > best_selection_key:
             best_selection_key = selection_key
@@ -1747,6 +1798,12 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         or best_detector_probability is None
     ):
         msg = "Training completed without producing a valid checkpoint"
+        raise RuntimeError(msg)
+    if best_ap_selection_key is None or best_ap_epoch is None:
+        msg = "Training completed without producing an AP diagnostic selection"
+        raise RuntimeError(msg)
+    if args.save_ap_best_checkpoint and best_ap_state is None:
+        msg = "AP-best checkpoint saving was enabled but no state was captured"
         raise RuntimeError(msg)
     model.load_state_dict(best_state)
     restored_state = model.state_dict()
@@ -1776,6 +1833,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
 
     selection = {
         "policy": SELECTION_POLICY,
+        "canonical": True,
         "split": "validation",
         "uses_hard_actions": False,
         "prevalence_weighting": "natural validation prevalence; no class weighting",
@@ -1837,15 +1895,40 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
     architecture_slug = args.architecture.replace("-", "_")
     artifact_name = f"student_{architecture_slug}_k{args.members}_{task}_seed{args.seed}"
     model_path, result_path = output_paths(args.output_dir, artifact_name, ".pt")
+    ap_model_path = model_path.with_name(f"{model_path.stem}_ap_best{model_path.suffix}")
+    checkpoint_config = {
+        **model_metadata,
+        "delta_s": delta_s,
+    }
+    diagnostic_protocol = {
+        "teacher_validation_targets": "required for all supervised and distilled cells",
+        "member_diagnostics": "full-validation AP/action metrics plus hard-subset diversity",
+        "epsilon_policy": EPSILON_POLICY_VERSION,
+    }
+    ap_history_row = next(row for row in history if row["epoch"] == best_ap_epoch)
+    ap_best_metadata = {
+        "enabled": bool(args.save_ap_best_checkpoint),
+        "saved": bool(args.save_ap_best_checkpoint),
+        "path": ap_model_path.name if args.save_ap_best_checkpoint else None,
+        "policy": AP_SELECTION_POLICY,
+        "canonical": False,
+        "uses_hard_actions": False,
+        "criteria": list(AP_SELECTION_CRITERIA),
+        "best_epoch": best_ap_epoch,
+        "best_key": list(best_ap_selection_key),
+        "validation_ap": float(ap_history_row["validation_ap"]),
+        "validation_ranked_probability_score": float(ap_history_row["validation_ranked_probability_score"]),
+        "validation_negative_log_likelihood": float(ap_history_row["validation_negative_log_likelihood"]),
+        "same_epoch_as_canonical": best_ap_epoch == best_epoch,
+    }
+    diagnostic_checkpoints = {"ap_best": ap_best_metadata}
 
     torch.save(
         {
             "format_version": MODEL_FORMAT_VERSION,
+            "checkpoint_role": "canonical",
             "state_dict": {k: v.cpu() for k, v in model.state_dict().items()},
-            "config": {
-                **model_metadata,
-                "delta_s": delta_s,
-            },
+            "config": checkpoint_config,
             "threshold": best_threshold,
             "threshold_source": threshold_source,
             "target_recall": args.target_recall,
@@ -1854,14 +1937,29 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
             "threshold_policy": threshold_policy,
             "objective": objective,
             "training_protocol": training_protocol,
-            "diagnostic_protocol": {
-                "teacher_validation_targets": "required for all supervised and distilled cells",
-                "member_diagnostics": "full-validation AP/action metrics plus hard-subset diversity",
-                "epsilon_policy": EPSILON_POLICY_VERSION,
-            },
+            "diagnostic_protocol": diagnostic_protocol,
         },
         model_path,
     )
+    if args.save_ap_best_checkpoint:
+        if best_ap_state is None:
+            msg = "AP-best checkpoint state unexpectedly missing during save"
+            raise RuntimeError(msg)
+        torch.save(
+            {
+                "format_version": MODEL_FORMAT_VERSION,
+                "checkpoint_role": "diagnostic",
+                "diagnostic_name": "ap_best",
+                "state_dict": best_ap_state,
+                "config": checkpoint_config,
+                "selection": ap_best_metadata,
+                "canonical_selection_policy": SELECTION_POLICY,
+                "objective": objective,
+                "training_protocol": training_protocol,
+                "source_report": result_path.name,
+            },
+            ap_model_path,
+        )
 
     result = {
         "model_format_version": MODEL_FORMAT_VERSION,
@@ -1877,6 +1975,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         "target_recall": args.target_recall,
         "severity_decision": SEVERITY_DECISION,
         "selection": selection,
+        "diagnostic_checkpoints": diagnostic_checkpoints,
         "threshold_policy": threshold_policy,
         "teacher_validation": teacher_validation,
         "student_teacher_agreement": teacher_agreement,
@@ -1896,6 +1995,8 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
     write_json(result_path, result)
 
     print(f"\nSaved model: {model_path}")
+    if args.save_ap_best_checkpoint:
+        print(f"Saved AP-best diagnostic model: {ap_model_path}")
     print(f"Saved results: {result_path}")
     print(f"Final AP: {final_metrics['ap']:.4f}")
     print(
@@ -1993,8 +2094,18 @@ def parse_args() -> argparse.Namespace:
 
     # Distillation
     parser.add_argument("--distill", action="store_true", help="Use knowledge distillation")
-    parser.add_argument("--alpha", type=float, default=1.0, help="Detector distillation weight")
-    parser.add_argument("--beta", type=float, default=0.5, help="Severity distillation weight")
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=DEFAULT_ALPHA,
+        help="Detector distillation weight",
+    )
+    parser.add_argument(
+        "--beta",
+        type=float,
+        default=DEFAULT_BETA,
+        help="Severity distillation weight",
+    )
     parser.add_argument(
         "--lambda-sev",
         type=float,
@@ -2005,7 +2116,12 @@ def parse_args() -> argparse.Namespace:
         "--kd-temperature",
         type=float,
         default=DEFAULT_KD_TEMPERATURE,
-        help="Conditional-severity KD temperature (detector margin KD is untempered)",
+        help="Temperature shared by detector and conditional-severity distillation",
+    )
+    parser.add_argument(
+        "--save-ap-best-checkpoint",
+        action="store_true",
+        help="Also save an AP-selected diagnostic checkpoint without changing canonical early stopping",
     )
 
     # Misc
