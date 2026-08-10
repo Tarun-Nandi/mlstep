@@ -8,6 +8,7 @@ random member-specific input scaling and independent member heads.
 import argparse
 import json
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
@@ -25,7 +26,7 @@ from mlstep.evaluation import (
     threshold_at_recall,
     write_json,
 )
-from mlstep.policy import EpsilonPolicy, boundary_probabilities, validate_probabilities
+from mlstep.policy import EpsilonPolicy, boundary_probabilities
 from mlstep.tabm import LinearEnsemble, MiniEnsembleInputScaling, SharedMLPBackbone
 
 # Default paths
@@ -55,6 +56,11 @@ DEFAULT_BATCH_SIZE: Final = 1024
 DEFAULT_EVAL_BATCH_SIZE: Final = 65536
 DEFAULT_NEGATIVE_RATIO: Final = 256
 DEFAULT_TARGET_RECALL: Final = 0.97
+CACHE_RESIDENCIES: Final = ("auto", "host", "cuda")
+DEFAULT_CACHE_RESIDENCY: Final = "auto"
+GPU_DATA_RESERVE_BYTES: Final = 16 * 2**30
+LOAD_CHUNK_BYTES: Final = 512 * 2**20
+PROGRESS_UPDATES_PER_PHASE: Final = 10
 
 # Interim week-experiment policy. At each epoch, use the highest detector
 # threshold that achieves the requested recall. Then compare checkpoints
@@ -78,6 +84,35 @@ EPSILON_POLICY_VERSION: Final = "epsilon-boundary-v1"
 WEEK_MAX_ACTION: Final = 3
 POLICY_DIAGNOSTIC_CONFIDENCES: Final = (1.0, 0.999, 0.995, 0.99, 0.975, 0.95, 0.9, 0.8, 0.7, 0.5)
 POLICY_DIAGNOSTIC_RECALLS: Final = (0.80, 0.90, 0.95, 0.97, 0.99, 1.0)
+
+FeatureMatrix = np.ndarray | torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class TrainEpochResult:
+    """Loss and phase timings for one unchanged undersampled epoch."""
+
+    loss: float
+    sampled_rows: int
+    batches: int
+    sampling_seconds: float
+    staging_seconds: float
+    optimization_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedEpoch:
+    """Contiguous device tensors for one preselected epoch."""
+
+    x: torch.Tensor
+    y: torch.Tensor
+    teacher_margin: torch.Tensor | None
+    teacher_severity: torch.Tensor | None
+    batch_has_positive: tuple[bool, ...]
+    sampled_rows: int
+    batches: int
+    sampling_seconds: float
+    staging_seconds: float
 
 
 class Student(nn.Module):
@@ -139,8 +174,8 @@ class Student(nn.Module):
             self.detector_head = LinearEnsemble(hidden_layers[-1], 1, k=k)
             self.severity_head = LinearEnsemble(hidden_layers[-1], N_SEVERITY_CLASSES, k=k)
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Run the model and combine ensemble probabilities."""
+    def forward_logits(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return member logits without computing unused training probabilities."""
         if x.ndim != MATRIX_NDIM or x.shape[1] != self.n_features:
             msg = f"Student expects shape (batch, {self.n_features}), received {tuple(x.shape)}"
             raise ValueError(msg)
@@ -157,6 +192,12 @@ class Student(nn.Module):
             representation = self.backbone(member_inputs)
             d_logit = self.detector_head(representation).squeeze(-1).transpose(0, 1)
             s_logits = self.severity_head(representation).transpose(0, 1)
+
+        return d_logit, s_logits
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run the model and combine ensemble probabilities."""
+        d_logit, s_logits = self.forward_logits(x)
 
         detector_probability = torch.sigmoid(d_logit)
         severity_probability = torch.softmax(s_logits, dim=-1)
@@ -232,6 +273,7 @@ def compute_loss(
     alpha: float = 1.0,
     beta: float = 0.5,
     lambda_sev: float = 0.1,
+    has_positive: bool | None = None,
 ) -> torch.Tensor:
     """Compute combined loss with optional distillation."""
     n_members = d_logit.shape[0]
@@ -254,7 +296,12 @@ def compute_loss(
     severity_loss = d_logit.new_zeros(())
     positive_mask = labels > 0
 
-    if positive_mask.any():
+    # The training loop supplies this CPU-derived flag to avoid synchronising
+    # the GPU merely to decide whether an unusually sparse batch has positives.
+    if has_positive is None:
+        has_positive = bool(positive_mask.any())
+
+    if has_positive:
         positive_logits = s_logits[:, positive_mask, :]
         severity_target = labels[positive_mask] - 1
         severity_target = severity_target.unsqueeze(0).expand(n_members, -1)
@@ -320,10 +367,203 @@ def checkpoint_selection_key(metrics: dict) -> tuple[int, int, int, int, float]:
     )
 
 
+def _synchronize(device: torch.device) -> None:
+    """Wait for queued CUDA work when recording a phase duration."""
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _progress_interval(n_batches: int) -> int:
+    """Print roughly ten progress updates without synchronising every batch."""
+    return max(1, n_batches // PROGRESS_UPDATES_PER_PHASE)
+
+
+def _load_array_resident(path: Path) -> np.ndarray:
+    """Read an NPY array sequentially into RAM with visible progress.
+
+    The old student kept the feature matrices as RDS-backed memory maps and
+    then accessed shuffled rows. Copying sequentially once avoids repeated
+    remote page faults while keeping every cached value unchanged.
+    """
+    source = np.load(path, mmap_mode="r", allow_pickle=False)
+    if source.ndim == 0:
+        return np.asarray(source).copy()
+
+    destination = np.empty(source.shape, dtype=source.dtype)
+    bytes_per_row = max(1, source[0:1].nbytes)
+    rows_per_chunk = max(1, LOAD_CHUNK_BYTES // bytes_per_row)
+    n_chunks = int(np.ceil(len(source) / rows_per_chunk))
+    progress_every = _progress_interval(n_chunks)
+    started = time.perf_counter()
+    print(
+        f"Loading {path.name}: {source.nbytes / 2**30:.2f} GiB in {n_chunks} sequential chunk(s)",
+        flush=True,
+    )
+    for chunk_number, start in enumerate(range(0, len(source), rows_per_chunk), start=1):
+        stop = min(start + rows_per_chunk, len(source))
+        destination[start:stop] = source[start:stop]
+        if chunk_number % progress_every == 0 or chunk_number == n_chunks:
+            elapsed = time.perf_counter() - started
+            print(
+                f"  {path.name}: {stop:,}/{len(source):,} rows ({stop / len(source):.0%}) in {elapsed:.1f}s",
+                flush=True,
+            )
+    return destination
+
+
+def _place_feature_matrices(
+    train_x: np.ndarray,
+    val_x: np.ndarray,
+    device: torch.device,
+    requested_residency: str,
+) -> tuple[FeatureMatrix, FeatureMatrix, str, float]:
+    """Keep feature matrices in host RAM or place them once on the GPU."""
+    if requested_residency not in CACHE_RESIDENCIES:
+        msg = f"cache residency must be one of {CACHE_RESIDENCIES}"
+        raise ValueError(msg)
+
+    feature_bytes = train_x.nbytes + val_x.nbytes
+    use_cuda = requested_residency == "cuda"
+    if requested_residency == "auto" and device.type == "cuda":
+        free_bytes, _ = torch.cuda.mem_get_info(device)
+        use_cuda = feature_bytes + GPU_DATA_RESERVE_BYTES <= free_bytes
+
+    if use_cuda and device.type != "cuda":
+        msg = "CUDA cache residency requires --device cuda"
+        raise ValueError(msg)
+
+    if not use_cuda:
+        if requested_residency == "auto" and device.type == "cuda":
+            free_bytes, _ = torch.cuda.mem_get_info(device)
+            print(
+                "Feature cache will remain in host RAM: "
+                f"need {feature_bytes / 2**30:.2f} GiB plus a "
+                f"{GPU_DATA_RESERVE_BYTES / 2**30:.0f} GiB reserve, "
+                f"but only {free_bytes / 2**30:.2f} GiB is free",
+                flush=True,
+            )
+        return train_x, val_x, "host", 0.0
+
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    required_bytes = feature_bytes + GPU_DATA_RESERVE_BYTES
+    if required_bytes > free_bytes:
+        msg = (
+            f"CUDA feature residency needs {feature_bytes / 2**30:.2f} GiB plus "
+            f"a {GPU_DATA_RESERVE_BYTES / 2**30:.0f} GiB working reserve, but "
+            f"only {free_bytes / 2**30:.2f}/{total_bytes / 2**30:.2f} GiB is free"
+        )
+        raise MemoryError(msg)
+
+    print(
+        f"Staging {feature_bytes / 2**30:.2f} GiB of features on {device} "
+        f"(free before staging: {free_bytes / 2**30:.2f} GiB)",
+        flush=True,
+    )
+    started = time.perf_counter()
+    train_device = torch.from_numpy(train_x).to(device)
+    print("  train_x copied to GPU", flush=True)
+    val_device = torch.from_numpy(val_x).to(device)
+    _synchronize(device)
+    elapsed = time.perf_counter() - started
+    allocated = torch.cuda.memory_allocated(device)
+    print(
+        f"  val_x copied to GPU; feature staging took {elapsed:.1f}s, CUDA allocated {allocated / 2**30:.2f} GiB",
+        flush=True,
+    )
+    return train_device, val_device, "cuda", elapsed
+
+
+def _selected_rows_to_device(
+    values: np.ndarray,
+    indices: np.ndarray,
+    device: torch.device,
+    *,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Gather NumPy rows once in the existing shuffled order and transfer once."""
+    selected = np.ascontiguousarray(values[indices])
+    tensor = torch.from_numpy(selected)
+    return tensor.to(device=device, dtype=dtype if dtype is not None else tensor.dtype)
+
+
+def _prepare_epoch(
+    features: FeatureMatrix,
+    labels: np.ndarray,
+    teacher_margin: np.ndarray | None,
+    teacher_severity: np.ndarray | None,
+    positive_indices: np.ndarray,
+    negative_indices: np.ndarray,
+    negative_ratio: int,
+    seed: int,
+    batch_size: int,
+    device: torch.device,
+) -> PreparedEpoch:
+    """Sample once and gather the unchanged shuffled epoch into contiguous tensors."""
+    sampling_start = time.perf_counter()
+    indices = random_undersampling(
+        positive_indices,
+        negative_indices,
+        negative_ratio,
+        seed,
+    )
+    if not len(indices):
+        msg = "An undersampled epoch must contain at least one training row"
+        raise ValueError(msg)
+    sampling_seconds = time.perf_counter() - sampling_start
+
+    n_batches = int(np.ceil(len(indices) / batch_size))
+    selected_labels = np.ascontiguousarray(labels[indices])
+    batch_has_positive = tuple(
+        bool(np.any(selected_labels[start : start + batch_size] > 0)) for start in range(0, len(indices), batch_size)
+    )
+
+    staging_start = time.perf_counter()
+    if isinstance(features, torch.Tensor):
+        wrong_device_type = features.device.type != device.type
+        wrong_device_index = device.index is not None and features.device.index != device.index
+        if wrong_device_type or wrong_device_index:
+            msg = f"Feature tensor is on {features.device}, expected {device}"
+            raise ValueError(msg)
+        index_tensor = torch.from_numpy(indices).to(device)
+        epoch_x = torch.index_select(features, 0, index_tensor)
+        del index_tensor
+    else:
+        epoch_x = _selected_rows_to_device(features, indices, device)
+    epoch_y = torch.from_numpy(selected_labels).to(device)
+
+    epoch_teacher_margin = None
+    epoch_teacher_severity = None
+    if teacher_margin is not None and teacher_severity is not None:
+        epoch_teacher_margin = _selected_rows_to_device(
+            teacher_margin,
+            indices,
+            device,
+            dtype=torch.float32,
+        )
+        epoch_teacher_severity = _selected_rows_to_device(
+            teacher_severity,
+            indices,
+            device,
+            dtype=torch.float32,
+        )
+    _synchronize(device)
+    return PreparedEpoch(
+        x=epoch_x,
+        y=epoch_y,
+        teacher_margin=epoch_teacher_margin,
+        teacher_severity=epoch_teacher_severity,
+        batch_has_positive=batch_has_positive,
+        sampled_rows=len(indices),
+        batches=n_batches,
+        sampling_seconds=sampling_seconds,
+        staging_seconds=time.perf_counter() - staging_start,
+    )
+
+
 def train_epoch(
     model: Student,
     optimizer: torch.optim.Optimizer,
-    features: np.ndarray,
+    features: FeatureMatrix,
     labels: np.ndarray,
     teacher_margin: np.ndarray | None,
     teacher_severity: np.ndarray | None,
@@ -334,44 +574,49 @@ def train_epoch(
     delta_s: float,
     alpha: float,
     beta: float,
-) -> float:
+    positive_indices: np.ndarray | None = None,
+    negative_indices: np.ndarray | None = None,
+    return_details: bool = False,
+) -> float | TrainEpochResult:
     """Train for one epoch with random undersampling."""
     model.train()
 
-    positives, negatives = training_index_pools(labels)
+    if positive_indices is None or negative_indices is None:
+        positive_indices, negative_indices = training_index_pools(labels)
 
-    # Sample negatives at the specified ratio
-    # Use epoch seed so each epoch gets different samples
-    indices = random_undersampling(positives, negatives, negative_ratio, seed)
-    if not len(indices):
-        msg = "An undersampled epoch must contain at least one training row"
-        raise ValueError(msg)
+    prepared = _prepare_epoch(
+        features,
+        labels,
+        teacher_margin,
+        teacher_severity,
+        positive_indices,
+        negative_indices,
+        negative_ratio,
+        seed,
+        batch_size,
+        device,
+    )
 
-    n_batches = int(np.ceil(len(indices) / batch_size))
-    total_loss = 0.0
+    loss_values = torch.empty(prepared.batches, device=device, dtype=torch.float32)
+    progress_every = _progress_interval(prepared.batches)
+    optimization_start = time.perf_counter()
 
-    for start_idx in range(0, len(indices), batch_size):
-        batch_indices = indices[start_idx : start_idx + batch_size]
-
-        # Load batch data
-        batch_x = torch.from_numpy(features[batch_indices]).to(device)
-        batch_y = torch.from_numpy(labels[batch_indices]).to(device)
+    for batch_number, start_idx in enumerate(range(0, prepared.sampled_rows, batch_size), start=1):
+        stop_idx = min(start_idx + batch_size, prepared.sampled_rows)
+        batch_x = prepared.x[start_idx:stop_idx]
+        batch_y = prepared.y[start_idx:stop_idx]
 
         # Get teacher targets for this batch (if distilling)
         batch_teacher_margin = None
         batch_teacher_severity = None
-        if teacher_margin is not None and teacher_severity is not None:
-            batch_teacher_margin = torch.from_numpy(teacher_margin[batch_indices]).to(
-                device=device, dtype=torch.float32
-            )
-            batch_teacher_severity = torch.from_numpy(teacher_severity[batch_indices]).to(
-                device=device, dtype=torch.float32
-            )
+        if prepared.teacher_margin is not None and prepared.teacher_severity is not None:
+            batch_teacher_margin = prepared.teacher_margin[start_idx:stop_idx]
+            batch_teacher_severity = prepared.teacher_severity[start_idx:stop_idx]
 
         optimizer.zero_grad(set_to_none=True)
 
         # Forward pass
-        d_logit, _, s_logits, _ = model(batch_x)
+        d_logit, s_logits = model.forward_logits(batch_x)
 
         # Compute loss
         loss = compute_loss(
@@ -383,6 +628,7 @@ def train_epoch(
             delta_s=delta_s,
             alpha=alpha,
             beta=beta,
+            has_positive=prepared.batch_has_positive[batch_number - 1],
         )
 
         # Backward pass with gradient clipping
@@ -390,39 +636,87 @@ def train_epoch(
         nn.utils.clip_grad_norm_(model.parameters(), GRADIENT_CLIP_NORM)
         optimizer.step()
 
-        total_loss += loss.item()
+        loss_values[batch_number - 1] = loss.detach()
+        if batch_number % progress_every == 0 or batch_number == prepared.batches:
+            _synchronize(device)
+            elapsed = time.perf_counter() - optimization_start
+            rows_done = stop_idx
+            print(
+                f"  train {batch_number:,}/{prepared.batches:,} batches | "
+                f"{rows_done:,}/{prepared.sampled_rows:,} rows | {elapsed:.1f}s",
+                flush=True,
+            )
 
-    return total_loss / n_batches
+    _synchronize(device)
+    optimization_seconds = time.perf_counter() - optimization_start
+    # One transfer/synchronisation preserves the former Python-float summation
+    # order without forcing a device sync after every optimizer step.
+    total_loss = sum(loss_values.cpu().tolist())
+    result = TrainEpochResult(
+        loss=total_loss / prepared.batches,
+        sampled_rows=prepared.sampled_rows,
+        batches=prepared.batches,
+        sampling_seconds=prepared.sampling_seconds,
+        staging_seconds=prepared.staging_seconds,
+        optimization_seconds=optimization_seconds,
+    )
+    return result if return_details else result.loss
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def predict_joint_probabilities(
     model: Student,
-    features: np.ndarray,
+    features: FeatureMatrix,
     device: torch.device,
     batch_size: int = 65536,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Predict joint class probabilities and any-halving probabilities."""
     model.eval()
 
-    # Collect predictions in batches
-    all_d = []
-    all_s = []
+    n_rows = len(features)
+    n_batches = int(np.ceil(n_rows / batch_size))
+    progress_every = _progress_interval(n_batches)
+    output_dtype = next(model.parameters()).dtype
+    # One pinned result matrix allows non-blocking D2H copies on CUDA. Column
+    # zero holds d and the remaining columns hold conditional severity s.
+    raw_output = torch.empty(
+        (n_rows, N_CLASSES),
+        dtype=output_dtype,
+        device="cpu",
+        pin_memory=device.type == "cuda",
+    )
+    prediction_start = time.perf_counter()
 
-    for start_idx in range(0, len(features), batch_size):
-        batch_x = torch.from_numpy(features[start_idx : start_idx + batch_size]).to(device)
+    for batch_number, start_idx in enumerate(range(0, n_rows, batch_size), start=1):
+        stop_idx = min(start_idx + batch_size, n_rows)
+        if isinstance(features, torch.Tensor):
+            batch_x = features[start_idx:stop_idx]
+        else:
+            batch_x = torch.from_numpy(features[start_idx:stop_idx]).to(device)
 
         _, d, _, s = model(batch_x)
+        packed = torch.cat((d.unsqueeze(-1), s), dim=-1)
+        raw_output[start_idx:stop_idx].copy_(
+            packed,
+            non_blocking=device.type == "cuda",
+        )
+        if batch_number % progress_every == 0 or batch_number == n_batches:
+            _synchronize(device)
+            elapsed = time.perf_counter() - prediction_start
+            print(
+                f"  validation {batch_number:,}/{n_batches:,} batches | {stop_idx:,}/{n_rows:,} rows | {elapsed:.1f}s",
+                flush=True,
+            )
 
-        all_d.append(d.cpu().numpy())
-        all_s.append(s.cpu().numpy())
-
-    # Concatenate all batches
-    d = np.concatenate(all_d)
-    s = np.concatenate(all_s)
+    _synchronize(device)
+    raw = raw_output.numpy()
+    # Keep detector scores contiguous because they are scanned repeatedly by
+    # AP, threshold and operating-point calculations.
+    d = raw[:, 0].copy()
+    s = raw[:, 1:]
 
     # Construct full 5-class distribution
-    q = np.zeros((len(d), N_CLASSES), dtype=d.dtype)
+    q = np.empty((len(d), N_CLASSES), dtype=d.dtype)
     q[:, 0] = 1.0 - d
     q[:, 1:] = d[:, None] * s
     return q, d
@@ -430,7 +724,7 @@ def predict_joint_probabilities(
 
 def evaluate_model(
     model: Student,
-    features: np.ndarray,
+    features: FeatureMatrix,
     labels: np.ndarray,
     device: torch.device,
     batch_size: int = 65536,
@@ -438,6 +732,7 @@ def evaluate_model(
     target_recall: float = DEFAULT_TARGET_RECALL,
     threshold: float | None = None,
     threshold_source: str | None = None,
+    include_diagnostics: bool = True,
 ) -> dict:
     """Evaluate the joint prediction at a selected or frozen threshold."""
     q, d = predict_joint_probabilities(model, features, device, batch_size)
@@ -449,6 +744,7 @@ def evaluate_model(
         target_recall=target_recall,
         threshold_source=threshold_source,
         detection_outputs=d,
+        include_diagnostics=include_diagnostics,
     )
 
 
@@ -458,7 +754,7 @@ def epsilon_policy_diagnostic(
     target_recall: float,
 ) -> dict:
     """Build an uncalibrated validation-only ASAD policy frontier."""
-    probabilities = validate_probabilities(probabilities)
+    probabilities = np.asarray(probabilities)
     labels = np.asarray(labels)
     if labels.ndim != 1 or len(labels) != len(probabilities):
         msg = "labels must be a one-dimensional array matching probabilities"
@@ -470,9 +766,10 @@ def epsilon_policy_diagnostic(
 
     # Use the exact boundary calculation used by EpsilonPolicy. An equivalent
     # sum in a different order can differ by one ULP at the selected cutoff.
-    # Copy the single column so the full boundary matrix can be released before
-    # the frontier is evaluated on the multi-million-row validation cache.
-    first_boundary = boundary_probabilities(probabilities, WEEK_MAX_ACTION)[:, 1].copy()
+    # Reuse this matrix for confidence selection, the frontier and the
+    # reference action so the multi-million-row float64 allocation occurs once.
+    boundaries = boundary_probabilities(probabilities, WEEK_MAX_ACTION)
+    first_boundary = boundaries[:, 1]
     recall_confidences = {
         f"{recall:.0%}": threshold_at_recall(labels, first_boundary, recall) for recall in POLICY_DIAGNOSTIC_RECALLS
     }
@@ -487,10 +784,14 @@ def epsilon_policy_diagnostic(
         labels,
         candidate_confidences,
         max_action=WEEK_MAX_ACTION,
+        boundaries=boundaries,
     )
 
     reference_policy = EpsilonPolicy(reference_confidence, WEEK_MAX_ACTION)
-    reference_actions = reference_policy.predict(probabilities)
+    reference_actions = (boundaries[:, 1:] >= reference_confidence).sum(
+        axis=1,
+        dtype=np.int8,
+    )
     reference_metrics = halving_action_metrics(
         reference_actions,
         labels,
@@ -536,6 +837,33 @@ def epsilon_policy_diagnostic(
     }
 
 
+def _validate_model_args(args: argparse.Namespace) -> None:
+    """Validate architecture and cache placement settings."""
+    if args.architecture not in ARCHITECTURES:
+        msg = f"architecture must be one of {ARCHITECTURES}"
+        raise ValueError(msg)
+    if args.architecture == "mlp" and args.members != 1:
+        msg = "The MLP control requires --members 1"
+        raise ValueError(msg)
+    if args.architecture == "tabm-mini" and args.members < MIN_TABM_MEMBERS:
+        msg = "TabM-mini requires --members of at least 2"
+        raise ValueError(msg)
+    if args.cache_residency not in CACHE_RESIDENCIES:
+        msg = f"cache-residency must be one of {CACHE_RESIDENCIES}"
+        raise ValueError(msg)
+    if args.cache_residency == "cuda" and args.device != "cuda":
+        msg = "--cache-residency cuda requires --device cuda"
+        raise ValueError(msg)
+    if not args.hidden or any(
+        isinstance(width, bool) or not isinstance(width, int) or width < 1 for width in args.hidden
+    ):
+        msg = "hidden must contain positive integer widths"
+        raise ValueError(msg)
+    if not 0.0 <= args.dropout < 1.0:
+        msg = "dropout must be in [0, 1)"
+        raise ValueError(msg)
+
+
 def _validate_args(args: argparse.Namespace) -> None:
     """Reject invalid training settings before loading a large cache."""
     positive_integer_arguments = {
@@ -551,23 +879,7 @@ def _validate_args(args: argparse.Namespace) -> None:
             msg = f"{name.replace('_', '-')} must be at least one"
             raise ValueError(msg)
 
-    if args.architecture not in ARCHITECTURES:
-        msg = f"architecture must be one of {ARCHITECTURES}"
-        raise ValueError(msg)
-    if args.architecture == "mlp" and args.members != 1:
-        msg = "The MLP control requires --members 1"
-        raise ValueError(msg)
-    if args.architecture == "tabm-mini" and args.members < MIN_TABM_MEMBERS:
-        msg = "TabM-mini requires --members of at least 2"
-        raise ValueError(msg)
-    if not args.hidden or any(
-        isinstance(width, bool) or not isinstance(width, int) or width < 1 for width in args.hidden
-    ):
-        msg = "hidden must contain positive integer widths"
-        raise ValueError(msg)
-    if not 0.0 <= args.dropout < 1.0:
-        msg = "dropout must be in [0, 1)"
-        raise ValueError(msg)
+    _validate_model_args(args)
     if args.lr <= 0.0 or args.weight_decay < 0.0:
         msg = "lr must be positive and weight-decay must be non-negative"
         raise ValueError(msg)
@@ -621,8 +933,12 @@ def _validate_cache_shapes(
             raise ValueError(msg)
 
 
-def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
+def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
     """Execute training loop with early stopping."""
+    # Preserve programmatic callers created before cache placement became a
+    # configurable command-line option.
+    if not hasattr(args, "cache_residency"):
+        args.cache_residency = DEFAULT_CACHE_RESIDENCY
     _validate_args(args)
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
@@ -630,39 +946,34 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
     # Determine cache directory based on preprocessing method
     cache_dir = args.cache_dir / "week" / args.preprocess
 
-    print(f"Loading cache from: {cache_dir}")
+    print(f"Loading cache from: {cache_dir}", flush=True)
 
-    # Load cached data (memory-mapped for large arrays)
-    # Copy-on-write keeps the arrays memory-mapped while presenting writable
-    # views to torch.from_numpy; writes would not alter the cache on disk.
-    train_x = np.load(cache_dir / "train_x.npy", mmap_mode="c")
-    train_y = np.load(cache_dir / "train_y.npy")
-    val_x = np.load(cache_dir / "val_x.npy", mmap_mode="c")
-    val_y = np.load(cache_dir / "val_y.npy")
+    # Read each cache once in sequential chunks. Repeated random access to an
+    # RDS-backed mmap was the dominant bottleneck for the week experiment.
+    cache_load_start = time.perf_counter()
+    train_x_host = _load_array_resident(cache_dir / "train_x.npy")
+    train_y = _load_array_resident(cache_dir / "train_y.npy")
+    val_x_host = _load_array_resident(cache_dir / "val_x.npy")
+    val_y = _load_array_resident(cache_dir / "val_y.npy")
 
-    print(f"Train: {train_x.shape}, {train_x.nbytes // 2**20:.1f} MB (mmap)")
-    print(f"Val: {val_x.shape}, {val_x.nbytes // 2**20:.1f} MB (mmap)")
-    print(f"Train positives: {(train_y > 0).sum()}")
-    print(f"Val positives: {(val_y > 0).sum()}")
+    print(f"Train: {train_x_host.shape}, {train_x_host.nbytes / 2**20:.1f} MiB (resident)")
+    print(f"Val: {val_x_host.shape}, {val_x_host.nbytes / 2**20:.1f} MiB (resident)")
 
     # Load teacher targets if distilling
     teacher_margin = None
     teacher_severity = None
     if args.distill:
-        print("Loading teacher targets...")
-        teacher_margin = np.load(
-            cache_dir / "train_teacher_margin.npy",
-            mmap_mode="r",
-        )
-        teacher_severity = np.load(
-            cache_dir / "train_teacher_severity.npy",
-            mmap_mode="r",
-        )
+        print("Loading teacher targets...", flush=True)
+        teacher_margin = _load_array_resident(cache_dir / "train_teacher_margin.npy")
+        teacher_severity = _load_array_resident(cache_dir / "train_teacher_severity.npy")
+
+    cache_load_seconds = time.perf_counter() - cache_load_start
+    print(f"Cache loaded into host RAM in {cache_load_seconds:.1f}s", flush=True)
 
     _validate_cache_shapes(
-        train_x,
+        train_x_host,
         train_y,
-        val_x,
+        val_x_host,
         val_y,
         teacher_margin,
         teacher_severity,
@@ -676,17 +987,36 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
 
     # The model emits a population margin. Adding delta_s maps it to the
     # sampled-data prior used by the detector's hard-label BCE.
-    n_positives = int((train_y > 0).sum())
-    n_negatives_full = int((train_y == 0).sum())
+    pool_start = time.perf_counter()
+    positive_indices, negative_indices = training_index_pools(train_y)
+    pool_seconds = time.perf_counter() - pool_start
+    n_positives = len(positive_indices)
+    n_negatives_full = len(negative_indices)
     if not n_positives or not n_negatives_full:
         msg = "Training data must contain both positive and negative examples"
         raise ValueError(msg)
+    print(f"Train positives: {n_positives:,}")
+    print(f"Val positives: {np.count_nonzero(val_y > 0):,}")
+    print(f"Training index pools built once in {pool_seconds:.2f}s")
     n_negatives_sampled = min(
         n_negatives_full,
         args.negative_ratio * n_positives,
     )
     delta_s = float(np.log(n_negatives_full / n_negatives_sampled))
     print(f"Student delta_S: {delta_s:.4f}")
+
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    train_x, val_x, cache_residency, feature_staging_seconds = _place_feature_matrices(
+        train_x_host,
+        val_x_host,
+        device,
+        args.cache_residency,
+    )
+    if cache_residency == "cuda":
+        # Device tensors own their copies; release the 37 GiB host duplicates.
+        del train_x_host, val_x_host
+    print(f"Feature cache residency: {cache_residency}", flush=True)
 
     # Create model
     model = Student(
@@ -711,6 +1041,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
         "dropout": model.dropout,
         "total_parameters": total_params,
         "trainable_parameters": trainable_params,
+        "cache_residency": cache_residency,
     }
 
     # Optimizer
@@ -726,6 +1057,8 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
     best_threshold = None
     patience_counter = 0
     best_state = None
+    best_probabilities = None
+    best_detector_probability = None
     history = []
 
     print(f"\nTraining for {args.epochs} epochs with patience {args.patience}")
@@ -734,17 +1067,20 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
     print(f"Members: {args.members}")
     print(f"Batch size: {args.batch_size}")
     print(f"Evaluation batch size: {args.eval_batch_size}")
+    print(f"Feature cache residency: {cache_residency}")
     print(f"Negative ratio: {args.negative_ratio}")
     print(f"Target detector recall: {args.target_recall:.1%}")
     print(f"Checkpoint policy: {SELECTION_POLICY}")
 
     for epoch in range(1, args.epochs + 1):
         epoch_start = time.perf_counter()
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
 
         # Use different seed each epoch for negative sampling
         epoch_seed = args.seed + epoch
 
-        train_loss = train_epoch(
+        train_result = train_epoch(
             model,
             optimizer,
             train_x,
@@ -758,17 +1094,33 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
             delta_s,
             args.alpha,
             args.beta,
+            positive_indices=positive_indices,
+            negative_indices=negative_indices,
+            return_details=True,
         )
+        if not isinstance(train_result, TrainEpochResult):
+            msg = "Detailed epoch training unexpectedly returned only a scalar loss"
+            raise TypeError(msg)
+        train_loss = train_result.loss
 
         # Evaluate on validation set
-        val_metrics = evaluate_model(
+        inference_start = time.perf_counter()
+        val_probabilities, val_detector_probability = predict_joint_probabilities(
             model,
             val_x,
-            val_y,
             device,
             batch_size=args.eval_batch_size,
-            target_recall=args.target_recall,
         )
+        inference_seconds = time.perf_counter() - inference_start
+        metrics_start = time.perf_counter()
+        val_metrics = evaluate(
+            val_probabilities,
+            val_y,
+            target_recall=args.target_recall,
+            detection_outputs=val_detector_probability,
+            include_diagnostics=False,
+        )
+        metrics_seconds = time.perf_counter() - metrics_start
         val_ap = float(val_metrics["ap"])
         severity_metrics = val_metrics["severity"]
         val_exact = float(severity_metrics["exact_on_positive"])
@@ -798,6 +1150,8 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
             raise FloatingPointError(msg)
 
         epoch_time = time.perf_counter() - epoch_start
+        gpu_peak_allocated_mib = torch.cuda.max_memory_allocated(device) / 2**20 if device.type == "cuda" else 0.0
+        gpu_peak_reserved_mib = torch.cuda.max_memory_reserved(device) / 2**20 if device.type == "cuda" else 0.0
         history.append(
             {
                 "epoch": epoch,
@@ -813,6 +1167,15 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
                 "threshold": selected_threshold,
                 "selection_key": list(selection_key),
                 "seconds": epoch_time,
+                "sampled_rows": train_result.sampled_rows,
+                "training_batches": train_result.batches,
+                "sampling_seconds": train_result.sampling_seconds,
+                "staging_seconds": train_result.staging_seconds,
+                "optimization_seconds": train_result.optimization_seconds,
+                "validation_inference_seconds": inference_seconds,
+                "validation_metrics_seconds": metrics_seconds,
+                "gpu_peak_allocated_mib": gpu_peak_allocated_mib,
+                "gpu_peak_reserved_mib": gpu_peak_reserved_mib,
             }
         )
 
@@ -821,7 +1184,11 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
             f"exact+ {val_exact:.4f} | over(all) {val_overprediction_rate:.6f} | "
             f"recall {achieved_recall:.4f} | AP {val_ap:.4f} | "
             f"threshold {selected_threshold:.6g} | "
-            f"time {epoch_time:.1f}s"
+            f"time {epoch_time:.1f}s "
+            f"(stage {train_result.staging_seconds:.1f}s, "
+            f"train {train_result.optimization_seconds:.1f}s, "
+            f"infer {inference_seconds:.1f}s, metrics {metrics_seconds:.1f}s, "
+            f"GPU peak {gpu_peak_allocated_mib / 1024:.1f} GiB)"
         )
 
         # Early stopping
@@ -831,6 +1198,8 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
             best_threshold = selected_threshold
             patience_counter = 0
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            best_probabilities = val_probabilities
+            best_detector_probability = val_detector_probability
         else:
             patience_counter += 1
             if patience_counter >= args.patience:
@@ -838,17 +1207,26 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
                 break
 
     # Load best model
-    if best_state is None or best_selection_key is None or best_epoch is None or best_threshold is None:
+    if (
+        best_state is None
+        or best_selection_key is None
+        or best_epoch is None
+        or best_threshold is None
+        or best_probabilities is None
+        or best_detector_probability is None
+    ):
         msg = "Training completed without producing a valid checkpoint"
         raise RuntimeError(msg)
     model.load_state_dict(best_state)
+    restored_state = model.state_dict()
+    if restored_state.keys() != best_state.keys() or any(
+        not torch.equal(restored_state[name].detach().cpu(), best_state[name]) for name in best_state
+    ):
+        msg = "Loaded model state does not match the selected checkpoint"
+        raise RuntimeError(msg)
     threshold_source = "selected with checkpoint on validation set"
-    final_probabilities, final_detector_probability = predict_joint_probabilities(
-        model,
-        val_x,
-        device,
-        batch_size=args.eval_batch_size,
-    )
+    final_probabilities = best_probabilities
+    final_detector_probability = best_detector_probability
     final_metrics = evaluate(
         final_probabilities,
         val_y,
@@ -861,10 +1239,10 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
     integer_key_matches = final_selection_key[:-1] == best_selection_key[:-1]
     ap_matches = np.isclose(final_selection_key[-1], best_selection_key[-1])
     if not integer_key_matches or not ap_matches:
-        msg = "Restored checkpoint does not reproduce its validation selection key"
+        msg = "Cached selected-epoch predictions do not reproduce their validation selection key"
         raise RuntimeError(msg)
     if final_metrics["recall"] + np.finfo(float).eps < args.target_recall:
-        msg = "Restored checkpoint does not satisfy the requested detector recall"
+        msg = "Cached selected-epoch predictions do not satisfy the requested detector recall"
         raise RuntimeError(msg)
 
     selection = {
@@ -923,6 +1301,14 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
         "selection": selection,
         "epsilon_policy_diagnostic": policy_diagnostic,
         "history": history,
+        "performance": {
+            "cache_load_seconds": cache_load_seconds,
+            "index_pool_seconds": pool_seconds,
+            "feature_staging_seconds": feature_staging_seconds,
+            "cache_residency": cache_residency,
+            "max_gpu_allocated_mib": max(row["gpu_peak_allocated_mib"] for row in history),
+            "max_gpu_reserved_mib": max(row["gpu_peak_reserved_mib"] for row in history),
+        },
     }
     write_json(result_path, result)
 
@@ -958,6 +1344,12 @@ def parse_args() -> argparse.Namespace:
         help="Preprocessing variant",
     )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Output directory")
+    parser.add_argument(
+        "--cache-residency",
+        default=DEFAULT_CACHE_RESIDENCY,
+        choices=CACHE_RESIDENCIES,
+        help="Keep resident feature matrices in host RAM, CUDA memory, or choose automatically",
+    )
 
     # Architecture
     parser.add_argument(

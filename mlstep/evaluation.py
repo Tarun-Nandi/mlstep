@@ -16,6 +16,7 @@ from mlstep.policy import EpsilonPolicy, boundary_probabilities, validate_probab
 TOP_FRACTION = 0.001
 PROBABILITY_NDIM = 2  # a probability matrix is two dimensional: (rows, classes)
 BINARY_COLUMNS = 2  # more columns than this means genuine multiclass output
+BOUNDARY_TOLERANCE = 1e-12
 
 
 def detection_scores(outputs: np.ndarray) -> np.ndarray:
@@ -54,6 +55,31 @@ def threshold_at_recall(targets: np.ndarray, scores: np.ndarray, target_recall: 
     return float(positive_scores[required - 1])
 
 
+def _ranking_diagnostics(
+    targets: np.ndarray,
+    scores: np.ndarray,
+    positive: np.ndarray,
+    n_positive: int,
+    selected_here: bool,
+) -> dict:
+    """Build report-only ranking diagnostics outside the hot selection path."""
+    top_n = min(len(targets), max(1, int(np.ceil(TOP_FRACTION * len(targets)))))
+    top = np.argpartition(scores, len(scores) - top_n)[-top_n:]
+    positives_at_top = int(positive[top].sum())
+    diagnostics = {
+        "top_fraction": TOP_FRACTION,
+        "top_n": top_n,
+        "precision_at_top": positives_at_top / top_n,
+        "recall_at_top": safe_divide(positives_at_top, n_positive),
+    }
+    if selected_here and n_positive:
+        diagnostics["validation_recall_sweep"] = {
+            f"{sweep_recall:.0%}": operating_point(targets, scores, sweep_recall)
+            for sweep_recall in (0.80, 0.90, 0.95, 0.97, 0.99, 1.0)
+        }
+    return diagnostics
+
+
 def evaluate(
     outputs: np.ndarray,
     targets: np.ndarray,
@@ -61,6 +87,7 @@ def evaluate(
     target_recall: float = 1.0,
     threshold_source: str | None = None,
     detection_outputs: np.ndarray | None = None,
+    include_diagnostics: bool = True,
 ) -> dict:
     """Evaluate rare-event detection and optional multiclass severity."""
     outputs = np.asarray(outputs)
@@ -112,11 +139,6 @@ def evaluate(
     precision = safe_divide(counts["true_positive"], counts["true_positive"] + counts["false_positive"])
     # recall: from all the positive boxes that need halving, how many is the model able to identify
     recall = safe_divide(counts["true_positive"], counts["true_positive"] + counts["false_negative"])
-    # Calculating top ranked examples
-    top_n = min(len(targets), max(1, int(np.ceil(TOP_FRACTION * len(targets)))))
-    top = np.argpartition(scores, len(scores) - top_n)[-top_n:]
-    positives_at_top = int(positive[top].sum())
-
     # This is the main metrics dictionary
     metrics = {
         "ap": detection_ap(scores, targets),
@@ -131,17 +153,10 @@ def evaluate(
         "f0_5": f_score(precision, recall, beta=0.5),  # Combines precision + recall (precision has higher weight)
         "mcc": mcc(counts),
         **counts,  # matthews correlation coefficient (uses all 4 confusion matrix counts)
-        "top_fraction": TOP_FRACTION,
-        "top_n": top_n,
-        "precision_at_top": positives_at_top / top_n,
-        "recall_at_top": safe_divide(positives_at_top, n_positive),
     }
 
-    if selected_here and n_positive:
-        metrics["validation_recall_sweep"] = {
-            f"{sweep_recall:.0%}": operating_point(targets, scores, sweep_recall)
-            for sweep_recall in (0.80, 0.90, 0.95, 0.97, 0.99, 1.0)
-        }
+    if include_diagnostics:
+        metrics.update(_ranking_diagnostics(targets, scores, positive, n_positive, selected_here))
     # Some more optinal multiclass metrics
     if outputs.ndim == PROBABILITY_NDIM and outputs.shape[1] > BINARY_COLUMNS:
         metrics["severity"] = exact_halvings_metrics(outputs, targets, detected)
@@ -264,58 +279,79 @@ def halving_action_metrics(
         msg = f"targets must be between 0 and {n_classes - 1}"
         raise ValueError(msg)
 
-    positive = targets > 0
-    detected = actions > 0
-    detected_positive = detected & positive
-    errors = actions - targets
-    positive_errors = errors[positive]
-    conditional_errors = errors[detected_positive]
-    overprediction = errors > 0
-    underprediction = errors < 0
-    overprediction_levels = np.maximum(errors, 0)
-    underprediction_levels = np.maximum(-errors, 0)
-
     confusion = np.bincount(
         targets * n_classes + actions,
         minlength=n_classes**2,
     ).reshape(n_classes, n_classes)
-    support = np.bincount(targets, minlength=n_classes)
-    counts = detection_counts(detected, positive)
+    support = confusion.sum(axis=1)
+    action_counts = confusion.sum(axis=0)
+    diagonal = np.diag(confusion)
+    total = int(confusion.sum())
+    positive_count = int(support[1:].sum())
 
-    predicted_substeps = np.left_shift(1, actions)
-    required_substeps = np.left_shift(1, targets)
-    overprediction_substeps = np.maximum(predicted_substeps - required_substeps, 0)
-    underprediction_substeps = np.maximum(required_substeps - predicted_substeps, 0)
-    rows_per_million = 1_000_000 / len(targets)
+    true_class = np.arange(n_classes, dtype=np.int64)[:, None]
+    action_class = np.arange(n_classes, dtype=np.int64)[None, :]
+    error = action_class - true_class
+    absolute_error = np.abs(error)
+    over_levels = np.maximum(error, 0)
+    under_levels = np.maximum(-error, 0)
+    substeps = np.left_shift(1, np.arange(n_classes, dtype=np.int64))
+    substep_error = substeps[None, :] - substeps[:, None]
+    over_substeps = np.maximum(substep_error, 0)
+    under_substeps = np.maximum(-substep_error, 0)
+
+    overprediction_count = int(confusion[error > 0].sum())
+    underprediction_count = int(confusion[error < 0].sum())
+    overprediction_level_sum = int(np.sum(confusion * over_levels))
+    underprediction_level_sum = int(np.sum(confusion * under_levels))
+    overprediction_substep_sum = int(np.sum(confusion * over_substeps))
+    underprediction_substep_sum = int(np.sum(confusion * under_substeps))
+    exact_count = int(diagonal.sum())
+    exact_positive_count = int(diagonal[1:].sum())
+
+    counts = {
+        "true_positive": int(confusion[1:, 1:].sum()),
+        "false_positive": int(confusion[0, 1:].sum()),
+        "false_negative": int(confusion[1:, 0].sum()),
+        "true_negative": int(confusion[0, 0]),
+    }
+    positive_confusion = confusion[1:, :]
+    positive_underprediction_count = int(positive_confusion[error[1:, :] < 0].sum())
+    positive_overprediction_count = int(positive_confusion[error[1:, :] > 0].sum())
+    positive_absolute_error_sum = int(np.sum(positive_confusion * absolute_error[1:, :]))
+    rows_per_million = 1_000_000 / total
+
+    def ratio_or_none(numerator: int, denominator: int) -> float | None:
+        return numerator / denominator if denominator else None
 
     return {
         "confusion": confusion.tolist(),
         "support_by_class": support.tolist(),
-        "action_counts": np.bincount(actions, minlength=n_classes).tolist(),
+        "action_counts": action_counts.tolist(),
         "recall_by_class": [
             float(confusion[label, label] / support[label]) if support[label] else None for label in range(n_classes)
         ],
         "exact_by_class": [
             float(confusion[label, label] / support[label]) if support[label] else None for label in range(n_classes)
         ],
-        "exact_count_all": int(np.count_nonzero(errors == 0)),
-        "exact_rate_all": float(np.mean(errors == 0)),
-        "exact_on_positive_count": int(np.count_nonzero(positive_errors == 0)),
-        "exact_on_positive": mean_or_none(positive_errors == 0),
-        "overprediction_count_all": int(np.count_nonzero(overprediction)),
-        "overprediction_rate_all": float(np.mean(overprediction)),
-        "overprediction_level_sum_all": int(overprediction_levels.sum()),
-        "overprediction_level_mean_all": float(np.mean(overprediction_levels)),
-        "underprediction_count_all": int(np.count_nonzero(underprediction)),
-        "underprediction_rate_all": float(np.mean(underprediction)),
-        "underprediction_level_sum_all": int(underprediction_levels.sum()),
-        "underprediction_level_mean_all": float(np.mean(underprediction_levels)),
-        "overprediction_substep_proxy_sum_all": int(overprediction_substeps.sum()),
-        "overprediction_substep_proxy_mean_all": float(np.mean(overprediction_substeps)),
-        "underprediction_substep_proxy_sum_all": int(underprediction_substeps.sum()),
-        "underprediction_substep_proxy_mean_all": float(np.mean(underprediction_substeps)),
+        "exact_count_all": exact_count,
+        "exact_rate_all": exact_count / total,
+        "exact_on_positive_count": exact_positive_count,
+        "exact_on_positive": ratio_or_none(exact_positive_count, positive_count),
+        "overprediction_count_all": overprediction_count,
+        "overprediction_rate_all": overprediction_count / total,
+        "overprediction_level_sum_all": overprediction_level_sum,
+        "overprediction_level_mean_all": overprediction_level_sum / total,
+        "underprediction_count_all": underprediction_count,
+        "underprediction_rate_all": underprediction_count / total,
+        "underprediction_level_sum_all": underprediction_level_sum,
+        "underprediction_level_mean_all": underprediction_level_sum / total,
+        "overprediction_substep_proxy_sum_all": overprediction_substep_sum,
+        "overprediction_substep_proxy_mean_all": overprediction_substep_sum / total,
+        "underprediction_substep_proxy_sum_all": underprediction_substep_sum,
+        "underprediction_substep_proxy_mean_all": underprediction_substep_sum / total,
         "false_positives_per_million": counts["false_positive"] * rows_per_million,
-        "overpredictions_per_million": int(np.count_nonzero(overprediction)) * rows_per_million,
+        "overpredictions_per_million": overprediction_count * rows_per_million,
         "detection_precision": safe_divide(
             counts["true_positive"],
             counts["true_positive"] + counts["false_positive"],
@@ -325,10 +361,13 @@ def halving_action_metrics(
             counts["true_positive"] + counts["false_negative"],
         ),
         **counts,
-        "mae_on_positive": mean_or_none(np.abs(positive_errors)),
-        "underprediction_rate": mean_or_none(positive_errors < 0),
-        "overprediction_rate": mean_or_none(positive_errors > 0),
-        "exact_given_detected_positive": mean_or_none(conditional_errors == 0),
+        "mae_on_positive": ratio_or_none(positive_absolute_error_sum, positive_count),
+        "underprediction_rate": ratio_or_none(positive_underprediction_count, positive_count),
+        "overprediction_rate": ratio_or_none(positive_overprediction_count, positive_count),
+        "exact_given_detected_positive": ratio_or_none(
+            exact_positive_count,
+            counts["true_positive"],
+        ),
     }
 
 
@@ -347,15 +386,59 @@ def exact_halvings_metrics(outputs: np.ndarray, targets: np.ndarray, detected: n
     return halving_action_metrics(actions, targets, n_classes=outputs.shape[1])
 
 
+def _validated_frontier_boundaries(
+    probabilities: np.ndarray,
+    max_action: int,
+    boundaries: np.ndarray | None,
+) -> np.ndarray:
+    """Build or validate cumulative boundaries used by a policy frontier."""
+    if isinstance(max_action, bool) or not isinstance(max_action, (int, np.integer)):
+        msg = "max_action must be an integer"
+        raise ValueError(msg)
+    if not 1 <= max_action < probabilities.shape[1]:
+        msg = f"max_action must be between 1 and {probabilities.shape[1] - 1}"
+        raise ValueError(msg)
+    if boundaries is None:
+        return boundary_probabilities(probabilities, max_action)
+
+    boundaries = np.asarray(boundaries)
+    expected_shape = (len(probabilities), max_action + 1)
+    if boundaries.shape != expected_shape:
+        msg = f"boundaries must have shape {expected_shape}"
+        raise ValueError(msg)
+    if not np.issubdtype(boundaries.dtype, np.number) or np.iscomplexobj(boundaries):
+        msg = "boundaries must contain real numeric values"
+        raise ValueError(msg)
+    if not np.isfinite(boundaries).all():
+        msg = "boundaries must be finite"
+        raise ValueError(msg)
+    if np.any((boundaries < 0.0) | (boundaries > 1.0)):
+        msg = "boundaries must be in [0, 1]"
+        raise ValueError(msg)
+    if not np.allclose(boundaries[:, 0], 1.0, rtol=0.0, atol=BOUNDARY_TOLERANCE):
+        msg = "the action-zero boundary must equal one"
+        raise ValueError(msg)
+    if np.any(np.diff(boundaries, axis=1) > BOUNDARY_TOLERANCE):
+        msg = "boundaries must be non-increasing across actions"
+        raise ValueError(msg)
+    return boundaries
+
+
 def epsilon_frontier(
     probabilities: np.ndarray,
     targets: np.ndarray,
     boundary_confidences: tuple[float, ...] | list[float],
     *,
     max_action: int = 3,
+    boundaries: np.ndarray | None = None,
 ) -> list[dict]:
-    """Evaluate a conservative epsilon-policy frontier."""
+    """Evaluate a conservative epsilon-policy frontier.
+
+    ``boundaries`` may be reused from :func:`boundary_probabilities` to avoid
+    rebuilding a large float64 matrix during the final policy diagnostic.
+    """
     probabilities = validate_probabilities(probabilities)
+    boundaries = _validated_frontier_boundaries(probabilities, max_action, boundaries)
     boundary_confidences = tuple(boundary_confidences)
     if not boundary_confidences:
         msg = "at least one boundary confidence is required"
@@ -367,19 +450,21 @@ def epsilon_frontier(
         confidences.append(policy.boundary_confidence)
     confidences = sorted(set(confidences), reverse=True)
 
-    boundaries = boundary_probabilities(probabilities, max_action)
-    row_indices = np.arange(len(probabilities))
     previous_actions = None
     frontier = []
 
     for confidence in confidences:
-        actions = (boundaries[:, 1:] >= confidence).sum(axis=1, dtype=np.int64)
-        actions = actions.astype(np.int8, copy=False)
+        actions = (boundaries[:, 1:] >= confidence).sum(axis=1, dtype=np.int8)
         if previous_actions is not None and np.array_equal(actions, previous_actions):
             continue
 
-        chosen_tail_probability = boundaries[row_indices, actions]
-        model_overprediction_risk = np.clip(1.0 - chosen_tail_probability, 0.0, 1.0)
+        model_overprediction_risk = np.take_along_axis(
+            boundaries,
+            actions[:, None],
+            axis=1,
+        ).ravel()
+        np.subtract(1.0, model_overprediction_risk, out=model_overprediction_risk)
+        np.clip(model_overprediction_risk, 0.0, 1.0, out=model_overprediction_risk)
         metrics = halving_action_metrics(actions, targets, n_classes=probabilities.shape[1])
         frontier.append(
             {
@@ -391,7 +476,7 @@ def epsilon_frontier(
                 "metrics": metrics,
             }
         )
-        previous_actions = actions.copy()
+        previous_actions = actions
 
     return frontier
 
