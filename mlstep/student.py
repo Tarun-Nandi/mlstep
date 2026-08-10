@@ -1,11 +1,8 @@
-"""Unified student model with optional distillation from XGBoost teacher.
+"""Unified MLP and TabM-mini students with optional XGBoost distillation.
 
-The model uses a shared trunk with two heads:
-- Detection head: predicts probability of any halving (population-scale)
-- Severity head: predicts distribution over 4 halving classes (conditional)
-
-Supports TabM-inspired parameter-efficient ensembling via input adapters.
-https://arxiv.org/pdf/2410.24210
+Both architectures use a shared backbone with a population-scale detector
+head and a conditional four-class severity head. TabM-mini additionally uses
+random member-specific input scaling and independent member heads.
 """
 
 import argparse
@@ -29,6 +26,7 @@ from mlstep.evaluation import (
     write_json,
 )
 from mlstep.policy import EpsilonPolicy, boundary_probabilities, validate_probabilities
+from mlstep.tabm import LinearEnsemble, MiniEnsembleInputScaling, SharedMLPBackbone
 
 # Default paths
 DEFAULT_OUTPUT_DIR: Final = Path(__file__).resolve().parent / "runs"
@@ -36,6 +34,14 @@ DEFAULT_OUTPUT_DIR: Final = Path(__file__).resolve().parent / "runs"
 DEFAULT_CACHE_DIR: Final = Path("/rds/user/rc-nand1/hpc-work/mlstep/cache")
 
 # Architecture defaults
+ARCHITECTURES: Final = ("mlp", "tabm-mini")
+DEFAULT_ARCHITECTURE: Final = "mlp"
+MIN_TABM_MEMBERS: Final = 2
+MODEL_FORMAT_VERSION: Final = 2
+ARCHITECTURE_VERSIONS: Final = {
+    "mlp": "mlp-dual-head-v1",
+    "tabm-mini": "tabm-mini-dual-head-v1",
+}
 HIDDEN_LAYERS: Final = [512, 256]
 DROPOUT: Final = 0.05
 GRADIENT_CLIP_NORM: Final = 5.0
@@ -46,6 +52,7 @@ N_SEVERITY_CLASSES: Final = N_CLASSES - 1
 DEFAULT_EPOCHS: Final = 80
 DEFAULT_PATIENCE: Final = 12
 DEFAULT_BATCH_SIZE: Final = 1024
+DEFAULT_EVAL_BATCH_SIZE: Final = 65536
 DEFAULT_NEGATIVE_RATIO: Final = 256
 DEFAULT_TARGET_RECALL: Final = 0.97
 
@@ -74,7 +81,14 @@ POLICY_DIAGNOSTIC_RECALLS: Final = (0.80, 0.90, 0.95, 0.97, 0.99, 1.0)
 
 
 class Student(nn.Module):
-    """Unified two-head student with optional parameter-efficient ensembling."""
+    """Matched MLP or faithful TabM-mini two-head student.
+
+    The public logits retain the member-first shapes used by ``compute_loss``:
+    detector logits have shape ``(K, B)`` and severity logits have shape
+    ``(K, B, 4)``. The MLP is the K=1 control. TabM-mini creates distinct
+    representations before the first feature-mixing layer, shares the entire
+    backbone, and uses independent member heads.
+    """
 
     def __init__(
         self,
@@ -82,50 +96,67 @@ class Student(nn.Module):
         hidden_layers: list[int] | None = None,
         k: int = 1,
         dropout: float = DROPOUT,
+        architecture: str = DEFAULT_ARCHITECTURE,
     ) -> None:
         super().__init__()
-        if k < 1:
-            msg = "The number of ensemble members must be at least one"
+        if architecture not in ARCHITECTURES:
+            msg = f"architecture must be one of {ARCHITECTURES}"
+            raise ValueError(msg)
+        if isinstance(k, bool) or not isinstance(k, int) or k < 1:
+            msg = "k must be a positive integer"
+            raise ValueError(msg)
+        if architecture == "mlp" and k != 1:
+            msg = "The MLP control requires exactly one member"
+            raise ValueError(msg)
+        if architecture == "tabm-mini" and k < MIN_TABM_MEMBERS:
+            msg = "TabM-mini requires at least two ensemble members"
             raise ValueError(msg)
 
-        hidden_layers = hidden_layers or HIDDEN_LAYERS
+        hidden_layers = list(HIDDEN_LAYERS if hidden_layers is None else hidden_layers)
+        if not hidden_layers:
+            msg = "hidden_layers must contain at least one width"
+            raise ValueError(msg)
+
+        self.architecture = architecture
+        self.architecture_version = ARCHITECTURE_VERSIONS[architecture]
         self.k = k
         self.n_features = n_features
+        self.hidden_layers = tuple(hidden_layers)
+        self.dropout = dropout
 
-        # Each member gets its own multiplicative scaling of the input features.
-        # Shape: (k, n_features) — learnable per-member scaling
-        self.adapters = nn.Parameter(torch.ones(k, n_features))
+        self.backbone = SharedMLPBackbone(
+            n_features,
+            hidden_layers,
+            dropout,
+        )
 
-        # Build shared trunk layers
-        layers: list[nn.Module] = []
-        input_dim = n_features
-        for hidden_dim in hidden_layers:
-            layers.extend(
-                (
-                    nn.Linear(input_dim, hidden_dim),
-                    nn.BatchNorm1d(hidden_dim),
-                    nn.SiLU(),
-                    nn.Dropout(dropout),
-                )
-            )
-            input_dim = hidden_dim
-
-        self.trunk = nn.Sequential(*layers)
-
-        # Two prediction heads
-        self.detector_head = nn.Linear(hidden_layers[-1], 1)  # Output: margin m
-        self.severity_head = nn.Linear(hidden_layers[-1], N_SEVERITY_CLASSES)
+        if architecture == "mlp":
+            self.input_scaling = None
+            self.detector_head: nn.Module = nn.Linear(hidden_layers[-1], 1)
+            self.severity_head: nn.Module = nn.Linear(hidden_layers[-1], N_SEVERITY_CLASSES)
+        else:
+            self.input_scaling = MiniEnsembleInputScaling(k, n_features)
+            self.detector_head = LinearEnsemble(hidden_layers[-1], 1, k=k)
+            self.severity_head = LinearEnsemble(hidden_layers[-1], N_SEVERITY_CLASSES, k=k)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run the model and combine ensemble probabilities."""
-        # (B, F) -> (K, B, F)
-        x = x.unsqueeze(0) * self.adapters.unsqueeze(1)
-        n_members, n_batch = x.shape[:2]
-        h = self.trunk(x.reshape(n_members * n_batch, -1))
-        h = h.reshape(n_members, n_batch, -1)
+        if x.ndim != MATRIX_NDIM or x.shape[1] != self.n_features:
+            msg = f"Student expects shape (batch, {self.n_features}), received {tuple(x.shape)}"
+            raise ValueError(msg)
 
-        d_logit = self.detector_head(h).squeeze(-1)  # (K, B)
-        s_logits = self.severity_head(h)  # (K, B, 4)
+        if self.architecture == "mlp":
+            representation = self.backbone(x)
+            d_logit = self.detector_head(representation).squeeze(-1).unsqueeze(0)
+            s_logits = self.severity_head(representation).unsqueeze(0)
+        else:
+            # A copy-free view becomes K distinct representations through the
+            # random-sign trainable scaling before any features are mixed.
+            member_inputs = x.unsqueeze(1).expand(-1, self.k, -1)
+            member_inputs = self.input_scaling(member_inputs)
+            representation = self.backbone(member_inputs)
+            d_logit = self.detector_head(representation).squeeze(-1).transpose(0, 1)
+            s_logits = self.severity_head(representation).transpose(0, 1)
 
         detector_probability = torch.sigmoid(d_logit)
         severity_probability = torch.softmax(s_logits, dim=-1)
@@ -144,6 +175,51 @@ class Student(nn.Module):
             ((1.0 - d).unsqueeze(-1), d.unsqueeze(-1) * s),
             dim=-1,
         )
+
+
+def student_from_checkpoint(checkpoint: dict) -> Student:
+    """Reconstruct a format-v2 student and strictly load its parameters.
+
+    Unversioned checkpoints belong to the earlier shared-head adapter model and
+    are intentionally not guessed to be either of the new architecture types.
+    """
+    if not isinstance(checkpoint, dict):
+        msg = "Student checkpoint must be a dictionary"
+        raise TypeError(msg)
+    if checkpoint.get("format_version") != MODEL_FORMAT_VERSION:
+        msg = (
+            f"Unsupported student checkpoint format; expected version {MODEL_FORMAT_VERSION}. "
+            "Unversioned checkpoints use the legacy adapter architecture."
+        )
+        raise ValueError(msg)
+
+    config = checkpoint.get("config")
+    state_dict = checkpoint.get("state_dict")
+    if not isinstance(config, dict) or not isinstance(state_dict, dict):
+        msg = "Student checkpoint must contain dictionary config and state_dict entries"
+        raise ValueError(msg)
+
+    required = {"architecture", "architecture_version", "n_features", "hidden", "k", "dropout"}
+    missing = sorted(required - config.keys())
+    if missing:
+        msg = f"Student checkpoint config is missing: {', '.join(missing)}"
+        raise ValueError(msg)
+
+    architecture = config["architecture"]
+    expected_architecture_version = ARCHITECTURE_VERSIONS.get(architecture)
+    if config["architecture_version"] != expected_architecture_version:
+        msg = "Student checkpoint architecture version is unsupported"
+        raise ValueError(msg)
+
+    model = Student(
+        n_features=config["n_features"],
+        hidden_layers=config["hidden"],
+        k=config["k"],
+        dropout=config["dropout"],
+        architecture=architecture,
+    )
+    model.load_state_dict(state_dict, strict=True)
+    return model
 
 
 def compute_loss(
@@ -466,6 +542,7 @@ def _validate_args(args: argparse.Namespace) -> None:
         "epochs": args.epochs,
         "patience": args.patience,
         "batch_size": args.batch_size,
+        "eval_batch_size": args.eval_batch_size,
         "negative_ratio": args.negative_ratio,
         "members": args.members,
     }
@@ -474,6 +551,20 @@ def _validate_args(args: argparse.Namespace) -> None:
             msg = f"{name.replace('_', '-')} must be at least one"
             raise ValueError(msg)
 
+    if args.architecture not in ARCHITECTURES:
+        msg = f"architecture must be one of {ARCHITECTURES}"
+        raise ValueError(msg)
+    if args.architecture == "mlp" and args.members != 1:
+        msg = "The MLP control requires --members 1"
+        raise ValueError(msg)
+    if args.architecture == "tabm-mini" and args.members < MIN_TABM_MEMBERS:
+        msg = "TabM-mini requires --members of at least 2"
+        raise ValueError(msg)
+    if not args.hidden or any(
+        isinstance(width, bool) or not isinstance(width, int) or width < 1 for width in args.hidden
+    ):
+        msg = "hidden must contain positive integer widths"
+        raise ValueError(msg)
     if not 0.0 <= args.dropout < 1.0:
         msg = "dropout must be in [0, 1)"
         raise ValueError(msg)
@@ -603,12 +694,24 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
         hidden_layers=args.hidden,
         k=args.members,
         dropout=args.dropout,
+        architecture=args.architecture,
     ).to(device)
 
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Parameters: {trainable_params:,} trainable / {total_params:,} total")
+    model_metadata = {
+        "format_version": MODEL_FORMAT_VERSION,
+        "architecture": model.architecture,
+        "architecture_version": model.architecture_version,
+        "n_features": train_x.shape[1],
+        "hidden": list(model.hidden_layers),
+        "k": model.k,
+        "dropout": model.dropout,
+        "total_parameters": total_params,
+        "trainable_parameters": trainable_params,
+    }
 
     # Optimizer
     optimizer = torch.optim.AdamW(
@@ -626,9 +729,11 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
     history = []
 
     print(f"\nTraining for {args.epochs} epochs with patience {args.patience}")
+    print(f"Architecture: {args.architecture}")
     print(f"Distillation: {args.distill}")
     print(f"Members: {args.members}")
     print(f"Batch size: {args.batch_size}")
+    print(f"Evaluation batch size: {args.eval_batch_size}")
     print(f"Negative ratio: {args.negative_ratio}")
     print(f"Target detector recall: {args.target_recall:.1%}")
     print(f"Checkpoint policy: {SELECTION_POLICY}")
@@ -661,6 +766,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
             val_x,
             val_y,
             device,
+            batch_size=args.eval_batch_size,
             target_recall=args.target_recall,
         )
         val_ap = float(val_metrics["ap"])
@@ -737,7 +843,12 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
         raise RuntimeError(msg)
     model.load_state_dict(best_state)
     threshold_source = "selected with checkpoint on validation set"
-    final_probabilities, final_detector_probability = predict_joint_probabilities(model, val_x, device)
+    final_probabilities, final_detector_probability = predict_joint_probabilities(
+        model,
+        val_x,
+        device,
+        batch_size=args.eval_batch_size,
+    )
     final_metrics = evaluate(
         final_probabilities,
         val_y,
@@ -777,16 +888,16 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
 
     # Save results
     task = "distilled" if args.distill else "supervised"
-    model_path, result_path = output_paths(args.output_dir, f"student_{task}", ".pt")
+    architecture_slug = args.architecture.replace("-", "_")
+    artifact_name = f"student_{architecture_slug}_k{args.members}_{task}_seed{args.seed}"
+    model_path, result_path = output_paths(args.output_dir, artifact_name, ".pt")
 
     torch.save(
         {
+            "format_version": MODEL_FORMAT_VERSION,
             "state_dict": {k: v.cpu() for k, v in model.state_dict().items()},
             "config": {
-                "n_features": train_x.shape[1],
-                "hidden": args.hidden,
-                "k": args.members,
-                "dropout": args.dropout,
+                **model_metadata,
                 "delta_s": delta_s,
             },
             "threshold": best_threshold,
@@ -799,9 +910,11 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
     )
 
     result = {
+        "model_format_version": MODEL_FORMAT_VERSION,
         "task": task,
         "seed": args.seed,
         "config": vars(args),
+        "model": model_metadata,
         "metrics": final_metrics,
         "threshold": best_threshold,
         "threshold_source": threshold_source,
@@ -847,6 +960,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Output directory")
 
     # Architecture
+    parser.add_argument(
+        "--architecture",
+        default=DEFAULT_ARCHITECTURE,
+        choices=ARCHITECTURES,
+        help="Student architecture",
+    )
     parser.add_argument("--hidden", type=int, nargs="+", default=HIDDEN_LAYERS, help="Hidden layer sizes")
     parser.add_argument("--members", type=int, default=1, help="Number of ensemble members (k)")
     parser.add_argument("--dropout", type=float, default=DROPOUT, help="Dropout probability")
@@ -855,6 +974,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS, help="Maximum epochs")
     parser.add_argument("--patience", type=int, default=DEFAULT_PATIENCE, help="Early stopping patience")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE, help="Batch size")
+    parser.add_argument(
+        "--eval-batch-size",
+        type=int,
+        default=DEFAULT_EVAL_BATCH_SIZE,
+        help="Validation inference batch size",
+    )
     parser.add_argument(
         "--negative-ratio",
         type=int,
