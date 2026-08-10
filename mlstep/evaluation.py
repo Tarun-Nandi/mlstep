@@ -223,7 +223,7 @@ def write_json(path: Path, content: dict) -> None:
 
 
 def exact_halvings_metrics(outputs: np.ndarray, targets: np.ndarray, detected: np.ndarray) -> dict:
-    """Calculate final end to end multiclass metrics."""
+    """Calculate end-to-end exact-halving and directional-error metrics."""
     n_classes = outputs.shape[1]
     positive = targets > 0
     predictions = np.where(detected, outputs[:, 1:].argmax(axis=1) + 1, 0)
@@ -234,8 +234,15 @@ def exact_halvings_metrics(outputs: np.ndarray, targets: np.ndarray, detected: n
         minlength=n_classes**2,
     ).reshape(n_classes, n_classes)
     support = np.bincount(targets, minlength=n_classes)
-    # Calculate errors on all genuine hard boxes
-    errors = predictions[positive] - targets[positive]
+    # Calculate signed action errors across all rows. This includes false
+    # positives on class 0 as overpredictions and detector misses as
+    # underpredictions.
+    all_errors = predictions - targets
+    positive_errors = all_errors[positive]
+    overprediction = all_errors > 0
+    underprediction = all_errors < 0
+    overprediction_levels = np.maximum(all_errors, 0)
+    underprediction_levels = np.maximum(-all_errors, 0)
     detected_positive = detected & positive
     conditional_errors = predictions[detected_positive] - targets[detected_positive]
 
@@ -246,11 +253,20 @@ def exact_halvings_metrics(outputs: np.ndarray, targets: np.ndarray, detected: n
             float(confusion[label, label] / support[label]) if support[label] else None for label in range(n_classes)
         ],
         # Fraction of all true positive boxes receiving exactly the correct halving
-        "exact_on_positive": mean_or_none(errors == 0),
+        "exact_on_positive_count": int(np.count_nonzero(positive_errors == 0)),
+        "exact_on_positive": mean_or_none(positive_errors == 0),
+        "overprediction_count_all": int(np.count_nonzero(overprediction)),
+        "overprediction_rate_all": float(np.mean(overprediction)),
+        "overprediction_level_sum_all": int(overprediction_levels.sum()),
+        "overprediction_level_mean_all": float(np.mean(overprediction_levels)),
+        "underprediction_count_all": int(np.count_nonzero(underprediction)),
+        "underprediction_rate_all": float(np.mean(underprediction)),
+        "underprediction_level_sum_all": int(underprediction_levels.sum()),
+        "underprediction_level_mean_all": float(np.mean(underprediction_levels)),
         # Mean absolute class error accross all positive boxes
-        "mae_on_positive": mean_or_none(np.abs(errors)),
-        "underprediction_rate": mean_or_none(errors < 0),
-        "overprediction_rate": mean_or_none(errors > 0),
+        "mae_on_positive": mean_or_none(np.abs(positive_errors)),
+        "underprediction_rate": mean_or_none(positive_errors < 0),
+        "overprediction_rate": mean_or_none(positive_errors > 0),
         # Exact halvings accuracy after restricing evaluation to true positives (for second network alone)
         "exact_given_detected_positive": mean_or_none(conditional_errors == 0),
         # "oracle_detection_always_one_exact_on_positive": mean_or_none(always_one_errors == 0),

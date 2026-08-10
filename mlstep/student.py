@@ -39,6 +39,22 @@ DEFAULT_EPOCHS: Final = 80
 DEFAULT_PATIENCE: Final = 12
 DEFAULT_BATCH_SIZE: Final = 1024
 DEFAULT_NEGATIVE_RATIO: Final = 256
+DEFAULT_TARGET_RECALL: Final = 0.97
+
+# Interim week-experiment policy. At each epoch, use the highest detector
+# threshold that achieves the requested recall. Then compare checkpoints
+# lexicographically using these criteria, rather than by detector AP alone.
+SELECTION_POLICY: Final = "recall-floor-exact-over-v1"
+THRESHOLD_RULE: Final = "highest validation threshold achieving target recall"
+THRESHOLD_SCORE: Final = "ensemble any-halving detector probability"
+SELECTION_CRITERIA: Final = (
+    "maximize severity.exact_on_positive_count",
+    "minimize severity.overprediction_count_all",
+    "minimize severity.overprediction_level_sum_all",
+    "minimize severity.underprediction_level_sum_all",
+    "maximize ap",
+)
+SEVERITY_DECISION: Final = "argmax conditional severity probability"
 
 
 class Student(nn.Module):
@@ -199,6 +215,26 @@ def compute_loss(
     return total_loss
 
 
+def checkpoint_selection_key(metrics: dict) -> tuple[int, int, int, int, float]:
+    """Return the lexicographic key used to select a student checkpoint.
+
+    Every checkpoint is evaluated at the highest detector threshold satisfying
+    the requested validation recall. Larger returned tuples are better.
+    """
+    severity = metrics.get("severity")
+    if severity is None:
+        msg = "Checkpoint selection requires multiclass severity metrics"
+        raise ValueError(msg)
+
+    return (
+        int(severity["exact_on_positive_count"]),
+        -int(severity["overprediction_count_all"]),
+        -int(severity["overprediction_level_sum_all"]),
+        -int(severity["underprediction_level_sum_all"]),
+        float(metrics["ap"]),
+    )
+
+
 def train_epoch(
     model: Student,
     optimizer: torch.optim.Optimizer,
@@ -281,8 +317,12 @@ def evaluate_model(
     labels: np.ndarray,
     device: torch.device,
     batch_size: int = 65536,
+    *,
+    target_recall: float = DEFAULT_TARGET_RECALL,
+    threshold: float | None = None,
+    threshold_source: str | None = None,
 ) -> dict:
-    """Evaluate model on validation set."""
+    """Evaluate the joint prediction at a selected or frozen threshold."""
     model.eval()
 
     # Collect predictions in batches
@@ -302,12 +342,19 @@ def evaluate_model(
     s = np.concatenate(all_s)
 
     # Construct full 5-class distribution
-    q = np.zeros((len(d), N_CLASSES))
+    q = np.zeros((len(d), N_CLASSES), dtype=d.dtype)
     q[:, 0] = 1.0 - d
     q[:, 1:] = d[:, None] * s
 
     # Evaluate using existing evaluation function
-    metrics = evaluate(q, labels, threshold=None, target_recall=1.0)
+    metrics = evaluate(
+        q,
+        labels,
+        threshold=threshold,
+        target_recall=target_recall,
+        threshold_source=threshold_source,
+        detection_outputs=d,
+    )
 
     return metrics
 
@@ -335,6 +382,9 @@ def _validate_args(args: argparse.Namespace) -> None:
     if args.alpha < 0.0 or args.beta < 0.0:
         msg = "distillation weights must be non-negative"
         raise ValueError(msg)
+    if not 0.0 < args.target_recall <= 1.0:
+        msg = "target-recall must be in (0, 1]"
+        raise ValueError(msg)
     if args.device == "cuda" and not torch.cuda.is_available():
         msg = "CUDA was requested but is not available"
         raise RuntimeError(msg)
@@ -360,6 +410,9 @@ def _validate_cache_shapes(
         raise ValueError(msg)
     if not len(train_y) or not len(val_y):
         msg = "Training and validation caches must not be empty"
+        raise ValueError(msg)
+    if not np.any(val_y > 0):
+        msg = "Validation labels must contain at least one positive example"
         raise ValueError(msg)
     if train_x.shape[1] != val_x.shape[1]:
         msg = "Training and validation caches have different feature counts"
@@ -464,15 +517,20 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
     )
 
     # Training loop
-    best_ap = -np.inf
+    best_selection_key = None
+    best_epoch = None
+    best_threshold = None
     patience_counter = 0
     best_state = None
+    history = []
 
     print(f"\nTraining for {args.epochs} epochs with patience {args.patience}")
     print(f"Distillation: {args.distill}")
     print(f"Members: {args.members}")
     print(f"Batch size: {args.batch_size}")
     print(f"Negative ratio: {args.negative_ratio}")
+    print(f"Target detector recall: {args.target_recall:.1%}")
+    print(f"Checkpoint policy: {SELECTION_POLICY}")
 
     for epoch in range(1, args.epochs + 1):
         epoch_start = time.perf_counter()
@@ -497,20 +555,73 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
         )
 
         # Evaluate on validation set
-        val_metrics = evaluate_model(model, val_x, val_y, device)
-        val_ap = val_metrics["ap"]
+        val_metrics = evaluate_model(
+            model,
+            val_x,
+            val_y,
+            device,
+            target_recall=args.target_recall,
+        )
+        val_ap = float(val_metrics["ap"])
+        severity_metrics = val_metrics["severity"]
+        val_exact = float(severity_metrics["exact_on_positive"])
+        val_overprediction_rate = float(severity_metrics["overprediction_rate_all"])
+        achieved_recall = float(val_metrics["recall"])
+        selection_key = checkpoint_selection_key(val_metrics)
+        selected_threshold = float(val_metrics["threshold"])
 
-        if not np.isfinite(train_loss) or not np.isfinite(val_ap):
-            msg = f"Non-finite value at epoch {epoch}: loss={train_loss}, val_ap={val_ap}"
+        if not all(
+            np.isfinite(value)
+            for value in (
+                train_loss,
+                val_ap,
+                val_exact,
+                val_overprediction_rate,
+                achieved_recall,
+                selected_threshold,
+            )
+        ):
+            msg = (
+                f"Non-finite value at epoch {epoch}: loss={train_loss}, "
+                f"val_ap={val_ap}, exact={val_exact}, "
+                f"overprediction_rate={val_overprediction_rate}, "
+                f"recall={achieved_recall}, "
+                f"threshold={selected_threshold}"
+            )
             raise FloatingPointError(msg)
 
         epoch_time = time.perf_counter() - epoch_start
+        history.append(
+            {
+                "epoch": epoch,
+                "training_loss": float(train_loss),
+                "validation_ap": val_ap,
+                "achieved_recall": achieved_recall,
+                "exact_on_positive": val_exact,
+                "exact_on_positive_count": int(severity_metrics["exact_on_positive_count"]),
+                "overprediction_count_all": int(severity_metrics["overprediction_count_all"]),
+                "overprediction_rate_all": val_overprediction_rate,
+                "overprediction_level_sum_all": int(severity_metrics["overprediction_level_sum_all"]),
+                "underprediction_level_sum_all": int(severity_metrics["underprediction_level_sum_all"]),
+                "threshold": selected_threshold,
+                "selection_key": list(selection_key),
+                "seconds": epoch_time,
+            }
+        )
 
-        print(f"Epoch {epoch:3d} | loss {train_loss:.4f} | val AP {val_ap:.4f} | time {epoch_time:.1f}s")
+        print(
+            f"Epoch {epoch:3d} | loss {train_loss:.4f} | "
+            f"exact+ {val_exact:.4f} | over(all) {val_overprediction_rate:.6f} | "
+            f"recall {achieved_recall:.4f} | AP {val_ap:.4f} | "
+            f"threshold {selected_threshold:.6g} | "
+            f"time {epoch_time:.1f}s"
+        )
 
         # Early stopping
-        if val_ap > best_ap:
-            best_ap = val_ap
+        if best_selection_key is None or selection_key > best_selection_key:
+            best_selection_key = selection_key
+            best_epoch = epoch
+            best_threshold = selected_threshold
             patience_counter = 0
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
         else:
@@ -520,11 +631,43 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
                 break
 
     # Load best model
-    if best_state is None:
+    if best_state is None or best_selection_key is None or best_epoch is None or best_threshold is None:
         msg = "Training completed without producing a valid checkpoint"
         raise RuntimeError(msg)
     model.load_state_dict(best_state)
-    final_metrics = evaluate_model(model, val_x, val_y, device)
+    threshold_source = "selected with checkpoint on validation set"
+    final_metrics = evaluate_model(
+        model,
+        val_x,
+        val_y,
+        device,
+        target_recall=args.target_recall,
+        threshold=best_threshold,
+        threshold_source=threshold_source,
+    )
+    final_selection_key = checkpoint_selection_key(final_metrics)
+    integer_key_matches = final_selection_key[:-1] == best_selection_key[:-1]
+    ap_matches = np.isclose(final_selection_key[-1], best_selection_key[-1])
+    if not integer_key_matches or not ap_matches:
+        msg = "Restored checkpoint does not reproduce its validation selection key"
+        raise RuntimeError(msg)
+    if final_metrics["recall"] + np.finfo(float).eps < args.target_recall:
+        msg = "Restored checkpoint does not satisfy the requested detector recall"
+        raise RuntimeError(msg)
+
+    selection = {
+        "policy": SELECTION_POLICY,
+        "threshold_rule": THRESHOLD_RULE,
+        "threshold_score": THRESHOLD_SCORE,
+        "target_recall": args.target_recall,
+        "criteria": list(SELECTION_CRITERIA),
+        "best_epoch": best_epoch,
+        "best_key": list(best_selection_key),
+        "threshold": best_threshold,
+        "achieved_recall": float(final_metrics["recall"]),
+        "selected_checkpoint_ap": float(final_metrics["ap"]),
+        "max_ap_observed": max(row["validation_ap"] for row in history),
+    }
 
     # Save results
     task = "distilled" if args.distill else "supervised"
@@ -540,6 +683,11 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
                 "dropout": args.dropout,
                 "delta_s": delta_s,
             },
+            "threshold": best_threshold,
+            "threshold_source": threshold_source,
+            "target_recall": args.target_recall,
+            "severity_decision": SEVERITY_DECISION,
+            "selection": selection,
         },
         model_path,
     )
@@ -549,13 +697,22 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
         "seed": args.seed,
         "config": vars(args),
         "metrics": final_metrics,
-        "best_ap": float(best_ap),
+        "threshold": best_threshold,
+        "threshold_source": threshold_source,
+        "target_recall": args.target_recall,
+        "severity_decision": SEVERITY_DECISION,
+        "selection": selection,
+        "history": history,
     }
     write_json(result_path, result)
 
     print(f"\nSaved model: {model_path}")
     print(f"Saved results: {result_path}")
     print(f"Final AP: {final_metrics['ap']:.4f}")
+    print(f"Best epoch: {best_epoch}")
+    print(f"Frozen threshold: {best_threshold:.6g}")
+    print(f"Exact on positives: {final_metrics['severity']['exact_on_positive']:.4f}")
+    print(f"All-row overprediction rate: {final_metrics['severity']['overprediction_rate_all']:.6f}")
 
     return result
 
@@ -591,6 +748,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
     parser.add_argument("--weight-decay", type=float, default=0.0001, help="Weight decay")
+    parser.add_argument(
+        "--target-recall",
+        type=float,
+        default=DEFAULT_TARGET_RECALL,
+        help="Minimum detector recall used to select the validation threshold",
+    )
 
     # Distillation
     parser.add_argument("--distill", action="store_true", help="Use knowledge distillation")
