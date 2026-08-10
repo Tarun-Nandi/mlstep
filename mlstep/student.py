@@ -20,7 +20,15 @@ import torch.nn.functional as F
 from torch import nn
 
 from mlstep.data import N_CLASSES, random_undersampling, training_index_pools
-from mlstep.evaluation import evaluate, output_paths, write_json
+from mlstep.evaluation import (
+    epsilon_frontier,
+    evaluate,
+    halving_action_metrics,
+    output_paths,
+    threshold_at_recall,
+    write_json,
+)
+from mlstep.policy import EpsilonPolicy, boundary_probabilities, validate_probabilities
 
 # Default paths
 DEFAULT_OUTPUT_DIR: Final = Path(__file__).resolve().parent / "runs"
@@ -55,6 +63,14 @@ SELECTION_CRITERIA: Final = (
     "maximize ap",
 )
 SEVERITY_DECISION: Final = "argmax conditional severity probability"
+
+# Development-only ASAD policy diagnostic. These probabilities are not yet
+# calibrated on an independent chronological block, so no epsilon is selected
+# for deployment in this version.
+EPSILON_POLICY_VERSION: Final = "epsilon-boundary-v1"
+WEEK_MAX_ACTION: Final = 3
+POLICY_DIAGNOSTIC_CONFIDENCES: Final = (1.0, 0.999, 0.995, 0.99, 0.975, 0.95, 0.9, 0.8, 0.7, 0.5)
+POLICY_DIAGNOSTIC_RECALLS: Final = (0.80, 0.90, 0.95, 0.97, 0.99, 1.0)
 
 
 class Student(nn.Module):
@@ -311,18 +327,13 @@ def train_epoch(
 
 
 @torch.no_grad()
-def evaluate_model(
+def predict_joint_probabilities(
     model: Student,
     features: np.ndarray,
-    labels: np.ndarray,
     device: torch.device,
     batch_size: int = 65536,
-    *,
-    target_recall: float = DEFAULT_TARGET_RECALL,
-    threshold: float | None = None,
-    threshold_source: str | None = None,
-) -> dict:
-    """Evaluate the joint prediction at a selected or frozen threshold."""
+) -> tuple[np.ndarray, np.ndarray]:
+    """Predict joint class probabilities and any-halving probabilities."""
     model.eval()
 
     # Collect predictions in batches
@@ -345,9 +356,24 @@ def evaluate_model(
     q = np.zeros((len(d), N_CLASSES), dtype=d.dtype)
     q[:, 0] = 1.0 - d
     q[:, 1:] = d[:, None] * s
+    return q, d
 
-    # Evaluate using existing evaluation function
-    metrics = evaluate(
+
+def evaluate_model(
+    model: Student,
+    features: np.ndarray,
+    labels: np.ndarray,
+    device: torch.device,
+    batch_size: int = 65536,
+    *,
+    target_recall: float = DEFAULT_TARGET_RECALL,
+    threshold: float | None = None,
+    threshold_source: str | None = None,
+) -> dict:
+    """Evaluate the joint prediction at a selected or frozen threshold."""
+    q, d = predict_joint_probabilities(model, features, device, batch_size)
+
+    return evaluate(
         q,
         labels,
         threshold=threshold,
@@ -356,7 +382,89 @@ def evaluate_model(
         detection_outputs=d,
     )
 
-    return metrics
+
+def epsilon_policy_diagnostic(
+    probabilities: np.ndarray,
+    labels: np.ndarray,
+    target_recall: float,
+) -> dict:
+    """Build an uncalibrated validation-only ASAD policy frontier."""
+    probabilities = validate_probabilities(probabilities)
+    labels = np.asarray(labels)
+    if labels.ndim != 1 or len(labels) != len(probabilities):
+        msg = "labels must be a one-dimensional array matching probabilities"
+        raise ValueError(msg)
+    positive = labels > 0
+    if not positive.any():
+        msg = "at least one positive label is required for the policy diagnostic"
+        raise ValueError(msg)
+
+    # Use the exact boundary calculation used by EpsilonPolicy. An equivalent
+    # sum in a different order can differ by one ULP at the selected cutoff.
+    # Copy the single column so the full boundary matrix can be released before
+    # the frontier is evaluated on the multi-million-row validation cache.
+    first_boundary = boundary_probabilities(probabilities, WEEK_MAX_ACTION)[:, 1].copy()
+    recall_confidences = {
+        f"{recall:.0%}": threshold_at_recall(labels, first_boundary, recall) for recall in POLICY_DIAGNOSTIC_RECALLS
+    }
+    reference_confidence = threshold_at_recall(labels, first_boundary, target_recall)
+    candidate_confidences = (
+        *POLICY_DIAGNOSTIC_CONFIDENCES,
+        *recall_confidences.values(),
+        reference_confidence,
+    )
+    frontier = epsilon_frontier(
+        probabilities,
+        labels,
+        candidate_confidences,
+        max_action=WEEK_MAX_ACTION,
+    )
+
+    reference_policy = EpsilonPolicy(reference_confidence, WEEK_MAX_ACTION)
+    reference_actions = reference_policy.predict(probabilities)
+    reference_metrics = halving_action_metrics(
+        reference_actions,
+        labels,
+        n_classes=N_CLASSES,
+    )
+    if reference_metrics["detection_recall"] + np.finfo(float).eps < target_recall:
+        msg = "Epsilon-policy reference does not satisfy its requested recall"
+        raise RuntimeError(msg)
+    return {
+        "policy": EPSILON_POLICY_VERSION,
+        "status": "development_only_uncalibrated",
+        "deployable": False,
+        "calibrated": False,
+        "selected_epsilon": None,
+        "probability_source": "mean ensemble-member joint distribution",
+        "formula": "max a such that P(Y >= a) >= boundary_confidence",
+        "boundary_comparison": ">=",
+        "probability_interpretation": (
+            "population-prior-corrected model scores; empirical calibration has not been established"
+        ),
+        "selected_on": "same validation period used for checkpoint selection",
+        "reporting_status": "optimistic development diagnostic, not held-out performance",
+        "max_action": WEEK_MAX_ACTION,
+        "action_domain": list(range(WEEK_MAX_ACTION + 1)),
+        "class4_handling": (
+            "q4 is combined with q3 for policy decisions; original y=4 targets remain class 4 in metrics"
+        ),
+        "raw_class4_probability": {
+            "mean_all": float(probabilities[:, 4].mean()),
+            "max_all": float(probabilities[:, 4].max()),
+            "mean_on_positive": float(probabilities[positive, 4].mean()),
+        },
+        "recall_derived_boundary_confidences": recall_confidences,
+        "reference_policy": {
+            "purpose": "comparison at the existing interim detector recall target; not automatically selected",
+            "target_recall": target_recall,
+            "boundary_confidence": reference_confidence,
+            "epsilon": reference_policy.epsilon,
+            "achieved_recall": reference_metrics["detection_recall"],
+            "metrics": reference_metrics,
+        },
+        "frontier": frontier,
+    }
 
 
 def _validate_args(args: argparse.Namespace) -> None:
@@ -636,14 +744,14 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
         raise RuntimeError(msg)
     model.load_state_dict(best_state)
     threshold_source = "selected with checkpoint on validation set"
-    final_metrics = evaluate_model(
-        model,
-        val_x,
+    final_probabilities, final_detector_probability = predict_joint_probabilities(model, val_x, device)
+    final_metrics = evaluate(
+        final_probabilities,
         val_y,
-        device,
-        target_recall=args.target_recall,
         threshold=best_threshold,
+        target_recall=args.target_recall,
         threshold_source=threshold_source,
+        detection_outputs=final_detector_probability,
     )
     final_selection_key = checkpoint_selection_key(final_metrics)
     integer_key_matches = final_selection_key[:-1] == best_selection_key[:-1]
@@ -668,6 +776,11 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
         "selected_checkpoint_ap": float(final_metrics["ap"]),
         "max_ap_observed": max(row["validation_ap"] for row in history),
     }
+    policy_diagnostic = epsilon_policy_diagnostic(
+        final_probabilities,
+        val_y,
+        args.target_recall,
+    )
 
     # Save results
     task = "distilled" if args.distill else "supervised"
@@ -702,6 +815,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
         "target_recall": args.target_recall,
         "severity_decision": SEVERITY_DECISION,
         "selection": selection,
+        "epsilon_policy_diagnostic": policy_diagnostic,
         "history": history,
     }
     write_json(result_path, result)
@@ -713,6 +827,14 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
     print(f"Frozen threshold: {best_threshold:.6g}")
     print(f"Exact on positives: {final_metrics['severity']['exact_on_positive']:.4f}")
     print(f"All-row overprediction rate: {final_metrics['severity']['overprediction_rate_all']:.6f}")
+    reference_policy = policy_diagnostic["reference_policy"]
+    print(
+        "ASAD policy diagnostic: "
+        f"confidence {reference_policy['boundary_confidence']:.6g} | "
+        f"epsilon {reference_policy['epsilon']:.6g} | "
+        f"exact+ {reference_policy['metrics']['exact_on_positive']:.4f} | "
+        f"over(all) {reference_policy['metrics']['overprediction_rate_all']:.6f}"
+    )
 
     return result
 
