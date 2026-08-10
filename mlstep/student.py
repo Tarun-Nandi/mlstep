@@ -74,14 +74,7 @@ POLICY_DIAGNOSTIC_RECALLS: Final = (0.80, 0.90, 0.95, 0.97, 0.99, 1.0)
 
 
 class Student(nn.Module):
-    """Unified two-head student with optional parameter-efficient ensembling.
-
-    Args:
-        n_features: Number of input features
-        hidden_layers: List of hidden layer sizes
-        k: Number of ensemble members (1 = single model)
-        dropout: Dropout probability
-    """
+    """Unified two-head student with optional parameter-efficient ensembling."""
 
     def __init__(
         self,
