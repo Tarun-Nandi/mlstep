@@ -15,6 +15,8 @@ from mlstep.data import (
     N_CLASSES,
     Feature,
     Preprocesser,
+    RobustPreprocesser,
+    StretchPreprocesser,
     discover_timesteps,
     feature_names,
     load_timesteps,
@@ -42,7 +44,7 @@ def _apply_preprocessing(
     x: np.ndarray,
     method: str,
     features: tuple[Feature, ...] | None = None,
-) -> tuple[Preprocesser | QuantileTransformer | None, np.ndarray]:
+) -> tuple[Preprocesser | QuantileTransformer | RobustPreprocesser | StretchPreprocesser | None, np.ndarray]:
     """Apply preprocessing method and return fitted preprocessor + transformed data."""
     if method == "physical":
         if features is None:
@@ -61,6 +63,20 @@ def _apply_preprocessing(
         # Avoid full sized copy
         x_transformed = transformer.fit_transform(x.astype(np.float32, copy=False))
         return transformer, x_transformed
+
+    if method == "robust":
+        if features is None:
+            msg = "features required for robust preprocessing"
+            raise ValueError(msg)
+        return RobustPreprocesser.fit_transform(x, features, clip_threshold=3.0)
+
+    if method.startswith("stretch"):
+        if features is None:
+            msg = "features required for stretch preprocessing"
+            raise ValueError(msg)
+        # Extract n_bins from method name (e.g., "stretch32" -> 32)
+        n_bins = int(method.replace("stretch", ""))
+        return StretchPreprocesser.fit_transform(x, features, n_bins=n_bins)
 
     if method == "raw":
         return None, x
@@ -84,10 +100,12 @@ def _load_features(
 
 def _preprocess_features(
     train_x: np.ndarray, val_x: np.ndarray, preprocess_method: str
-) -> tuple[Preprocesser | QuantileTransformer | None, np.ndarray, np.ndarray]:
+) -> tuple[
+    Preprocesser | QuantileTransformer | RobustPreprocesser | StretchPreprocesser | None, np.ndarray, np.ndarray
+]:
     """Fit preprocessing on training data and transform both of the splits."""
     print(f"Preprocessing training ({preprocess_method})...")
-    features_arg = FEATURES if preprocess_method == "physical" else None
+    features_arg = FEATURES if preprocess_method in ("physical", "robust", "stretch32", "stretch128") else None
     preprocessor, train_x_processed = _apply_preprocessing(
         train_x,
         preprocess_method,
@@ -98,6 +116,8 @@ def _preprocess_features(
         val_x_processed = preprocessor.transform(val_x, copy=False)
     elif preprocess_method == "quantile":
         val_x_processed = preprocessor.transform(val_x.astype(np.float32, copy=False))
+    elif preprocess_method == "robust" or preprocess_method.startswith("stretch"):
+        val_x_processed = preprocessor.transform(val_x, copy=False)
     else:
         val_x_processed = val_x
 
@@ -110,7 +130,7 @@ def _save_features_and_labels(
     train_y: np.ndarray,
     val_x: np.ndarray,
     val_y: np.ndarray,
-    preprocessor: Preprocesser | QuantileTransformer | None,
+    preprocessor: Preprocesser | QuantileTransformer | RobustPreprocesser | StretchPreprocesser | None,
     preprocess_method: str,
 ) -> None:
     """Save features, labels, and preprocessor state."""
@@ -132,6 +152,12 @@ def _save_features_and_labels(
             n_quantiles_in=preprocessor.n_quantiles_,
             quantiles=preprocessor.quantiles_,
         )
+    elif preprocess_method == "robust" or preprocess_method.startswith("stretch"):
+        preprocessor_state = {
+            **preprocessor.state(),
+            "features": [{"name": f.name, "channels": f.channels, "transform": f.transform} for f in FEATURES],
+        }
+        np.savez(cache_dir / "preprocessor_state.npz", **preprocessor_state)
     else:
         np.savez(cache_dir / "preprocessor_state.npz", method=preprocess_method)
 
@@ -325,8 +351,10 @@ def parse_args() -> argparse.Namespace:
         "--preprocess",
         type=str,
         default="physical",
-        choices=["physical", "quantile", "raw"],
-        help="Preprocessing method: physical (log/arcsinh+standardize), quantile (force N(0,1)), raw (no transform)",
+        choices=["physical", "quantile", "raw", "robust", "stretch32", "stretch128"],
+        help="Preprocessing method: physical (log/arcsinh+standardize),"
+        " quantile (force N(0,1)), raw (no transform),"
+        " robust (median/IQR+tanh clip), stretch32/128 (unsupervised CDF stretch)",
     )
     return parser.parse_args()
 

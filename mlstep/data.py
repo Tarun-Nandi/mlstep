@@ -26,6 +26,9 @@ class Feature:
     transform: str
 
 
+# Available preprocessing methods for experiments
+PREPROCESSING_METHODS = ("standard", "robust", "stretch32", "stretch128", "ple64")
+
 FEATURES = (
     Feature("temp", 1, "standard"),
     Feature("pres", 1, "standard"),
@@ -102,6 +105,188 @@ class Preprocesser:
             "scale": self.scale,
             "mean": self.mean,
             "std": self.std,
+        }
+
+
+@dataclass
+class RobustPreprocesser:
+    """Convert atmospheric variables using median/IQR robust scaling with smooth clipping.
+
+    This preprocessing is less sensitive to extreme outliers than mean/std scaling.
+    Uses the RealMLP approach: median centering, IQR scaling, and smooth tanh clipping.
+    """
+
+    scale: np.ndarray
+    median: np.ndarray
+    iqr: np.ndarray
+    clip_threshold: float
+    features: tuple[Feature, ...]
+
+    @classmethod
+    def fit_transform(
+        cls, x: np.ndarray, features, clip_threshold: float = 3.0
+    ) -> tuple["RobustPreprocesser", np.ndarray]:
+        """Apply transformations and calculate robust statistics."""
+        x = np.asarray(x, dtype=np.float32, order="c")
+        nonzero = np.zeros(x.shape[1], dtype=np.int64)
+        absolute_sum = np.zeros(x.shape[1])
+
+        for chunk in chunks(x):
+            nonzero += np.count_nonzero(chunk, axis=0)
+            absolute_sum += np.abs(chunk).sum(axis=0, dtype=np.float64)
+
+        scale = np.where(nonzero > 0, absolute_sum / np.maximum(nonzero, 1), 1.0).astype(np.float32)
+        transform_in_place(x, scale, features)
+
+        # Compute median (50th percentile)
+        median = np.zeros(x.shape[1], dtype=np.float64)
+        for chunk in chunks(x):
+            median += np.median(chunk, axis=0)
+        median = (median / (len(x) / CHUNK_SIZE)).astype(np.float32)
+
+        # Compute IQR (75th - 25th percentile)
+        q75 = np.zeros(x.shape[1], dtype=np.float64)
+        q25 = np.zeros(x.shape[1], dtype=np.float64)
+        for chunk in chunks(x):
+            q75 += np.percentile(chunk, 75, axis=0)
+            q25 += np.percentile(chunk, 25, axis=0)
+        q75 = (q75 / (len(x) / CHUNK_SIZE)).astype(np.float32)
+        q25 = (q25 / (len(x) / CHUNK_SIZE)).astype(np.float32)
+        iqr = q75 - q25
+        iqr[iqr == 0] = 1.0
+
+        # Robust scaling: subtract median, divide by IQR
+        x -= median
+        x /= iqr
+
+        # Smooth clipping using tanh
+        if clip_threshold > 0:
+            np.tanh(np.clip(x, -clip_threshold, clip_threshold) / clip_threshold, out=x)
+            x *= clip_threshold
+
+        return cls(scale, median, iqr, clip_threshold, features), x
+
+    def transform(self, x: np.ndarray, *, copy: bool = True) -> np.ndarray:
+        """Transform new data using learned robust statistics."""
+        out = np.array(x, dtype=np.float32, order="c", copy=copy)
+        transform_in_place(out, self.scale, self.features)
+        out -= self.median
+        out /= self.iqr
+        if self.clip_threshold > 0:
+            np.tanh(np.clip(out, -self.clip_threshold, self.clip_threshold) / self.clip_threshold, out=out)
+            out *= self.clip_threshold
+        return out
+
+    def state(self) -> dict[str, np.ndarray]:
+        """Return learned robust statistics."""
+        return {
+            "scale": self.scale,
+            "median": self.median,
+            "iqr": self.iqr,
+            "clip_threshold": np.array([self.clip_threshold]),
+        }
+
+
+@dataclass
+class StretchPreprocesser:
+    """Apply unsupervised piecewise-linear CDF-like stretch transformation.
+
+    Based on the Tabular Numeric Stretch Transformation paper.
+    Divides each feature into quantile bins and applies a CDF-like stretch.
+    """
+
+    scale: np.ndarray
+    quantiles: np.ndarray  # Shape: (n_bins + 1, n_features)
+    n_bins: int
+    features: tuple[Feature, ...]
+
+    @classmethod
+    def fit_transform(cls, x: np.ndarray, features, n_bins: int = 128) -> tuple["StretchPreprocesser", np.ndarray]:
+        """Apply transformations and fit quantile bins."""
+        x = np.asarray(x, dtype=np.float32, order="c")
+        nonzero = np.zeros(x.shape[1], dtype=np.int64)
+        absolute_sum = np.zeros(x.shape[1])
+
+        for chunk in chunks(x):
+            nonzero += np.count_nonzero(chunk, axis=0)
+            absolute_sum += np.abs(chunk).sum(axis=0, dtype=np.float64)
+
+        scale = np.where(nonzero > 0, absolute_sum / np.maximum(nonzero, 1), 1.0).astype(np.float32)
+        transform_in_place(x, scale, features)
+
+        # Compute quantiles for each feature
+        quantile_probs = np.linspace(0, 1, n_bins + 1)
+        quantiles = np.zeros((n_bins + 1, x.shape[1]), dtype=np.float32)
+
+        for i, q in enumerate(quantile_probs):
+            q_values = np.zeros(x.shape[1], dtype=np.float64)
+            for chunk in chunks(x):
+                q_values += np.percentile(chunk, q * 100, axis=0)
+            quantiles[i] = (q_values / (len(x) / CHUNK_SIZE)).astype(np.float32)
+
+        # Apply stretch transformation
+        stretched = np.empty_like(x)
+        n_features = x.shape[1]
+
+        for feat_idx in range(n_features):
+            col = x[:, feat_idx]
+            feat_quantiles = quantiles[:, feat_idx]
+
+            # For each value, find its bin and apply stretch
+            # Digitize returns 1-based bin indices
+            bin_indices = np.digitize(col, feat_quantiles[1:-1], right=False)
+            bin_indices = np.clip(bin_indices - 1, 0, n_bins - 1)
+
+            # Linear interpolation within bin
+            bin_left = feat_quantiles[bin_indices]
+            bin_right = feat_quantiles[bin_indices + 1]
+            bin_width = bin_right - bin_left
+            bin_width[bin_width == 0] = 1.0  # Avoid division by zero
+
+            # Normalized position within bin [0, 1]
+            position = (col - bin_left) / bin_width
+            position = np.clip(position, 0, 1)
+
+            # Apply CDF-like stretch
+            stretched_pos = (bin_indices + position) / n_bins
+            stretched[:, feat_idx] = stretched_pos.astype(np.float32)
+
+        return cls(scale, quantiles, n_bins, features), stretched
+
+    def transform(self, x: np.ndarray, *, copy: bool = True) -> np.ndarray:
+        """Transform new data using learned quantiles."""
+        out = np.array(x, dtype=np.float32, order="c", copy=copy)
+        transform_in_place(out, self.scale, self.features)
+
+        stretched = np.empty_like(out)
+        n_features = out.shape[1]
+
+        for feat_idx in range(n_features):
+            col = out[:, feat_idx]
+            feat_quantiles = self.quantiles[:, feat_idx]
+
+            bin_indices = np.digitize(col, feat_quantiles[1:-1], right=False)
+            bin_indices = np.clip(bin_indices - 1, 0, self.n_bins - 1)
+
+            bin_left = feat_quantiles[bin_indices]
+            bin_right = feat_quantiles[bin_indices + 1]
+            bin_width = bin_right - bin_left
+            bin_width[bin_width == 0] = 1.0
+
+            position = (col - bin_left) / bin_width
+            position = np.clip(position, 0, 1)
+
+            stretched_pos = (bin_indices + position) / self.n_bins
+            stretched[:, feat_idx] = stretched_pos.astype(np.float32)
+
+        return stretched
+
+    def state(self) -> dict[str, np.ndarray]:
+        """Return learned quantile boundaries."""
+        return {
+            "scale": self.scale,
+            "quantiles": self.quantiles,
+            "n_bins": np.array([self.n_bins]),
         }
 
 
