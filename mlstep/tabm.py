@@ -3,6 +3,16 @@
 import torch
 from torch import nn
 
+# Re-export PiecewiseLinearEmbedding for use in student.py
+from mlstep.embeddings import PiecewiseLinearEmbedding
+
+__all__ = [
+    "LinearEnsemble",
+    "MiniEnsembleInputScaling",
+    "PiecewiseLinearEmbedding",
+    "SharedMLPBackbone",
+]
+
 ENSEMBLE_NDIM = 3
 MIN_MLP_NDIM = 2
 

@@ -23,6 +23,12 @@ from mlstep.data import (
     split_timesteps,
 )
 
+# PLE64 configuration
+PLE64_N_FEATURES = 64
+PLE64_N_BINS = 48
+PLE64_EMBEDDING_DIM = 12
+PLE64_OUTPUT_DIM = PLE64_N_FEATURES * PLE64_EMBEDDING_DIM + (266 - PLE64_N_FEATURES)  # 970
+
 DEFAULT_OUTPUT_DIR: Final = Path(__file__).resolve().parent / "runs"
 DEFAULT_CACHE_DIR: Final = Path("/rds/user/rc-nand1/hpc-work/mlstep/cache")
 
@@ -78,6 +84,14 @@ def _apply_preprocessing(
         n_bins = int(method.replace("stretch", ""))
         return StretchPreprocesser.fit_transform(x, features, n_bins=n_bins)
 
+    if method == "ple64":
+        # PLE64 uses physical preprocessing for features
+        # The PLE embedding is applied in the model, not during preprocessing
+        if features is None:
+            msg = "features required for PLE64 preprocessing"
+            raise ValueError(msg)
+        return Preprocesser.fit_transform(x, features)
+
     if method == "raw":
         return None, x
 
@@ -132,6 +146,7 @@ def _save_features_and_labels(
     val_y: np.ndarray,
     preprocessor: Preprocesser | QuantileTransformer | RobustPreprocesser | StretchPreprocesser | None,
     preprocess_method: str,
+    ple_metadata: dict | None = None,
 ) -> None:
     """Save features, labels, and preprocessor state."""
     print("Saving features and labels...")
@@ -158,6 +173,18 @@ def _save_features_and_labels(
             "features": [{"name": f.name, "channels": f.channels, "transform": f.transform} for f in FEATURES],
         }
         np.savez(cache_dir / "preprocessor_state.npz", **preprocessor_state)
+    elif preprocess_method == "ple64":
+        preprocessor_state = {
+            **preprocessor.state(),
+            "features": [{"name": f.name, "channels": f.channels, "transform": f.transform} for f in FEATURES],
+        }
+        np.savez(cache_dir / "preprocessor_state.npz", **preprocessor_state)
+        # Save PLE-specific metadata
+        if ple_metadata is not None:
+            np.savez(
+                cache_dir / "ple_metadata.npz",
+                **{k: np.asarray(v) if isinstance(v, (list, np.ndarray)) else v for k, v in ple_metadata.items()},
+            )
     else:
         np.savez(cache_dir / "preprocessor_state.npz", method=preprocess_method)
 
@@ -188,6 +215,52 @@ def _load_teacher(teacher_path: Path) -> tuple[xgb.XGBClassifier, list[int], lis
     print(f"Teacher delta_T = log({train_class_counts[0]} / {train_class_counts_used[0]}) = {delta_t:.4f}")
 
     return teacher, train_class_counts, train_class_counts_used, delta_t
+
+
+def _compute_ple_bin_boundaries(
+    x: np.ndarray,
+    n_features: int,
+    n_bins: int,
+) -> np.ndarray:
+    """Compute quantile bin boundaries for PLE.
+
+    Args:
+        x: Training data of shape (n_samples, n_features)
+        n_features: Number of features to compute bins for
+        n_bins: Number of bins per feature
+
+    Returns
+    -------
+        Bin boundaries of shape (n_features, n_bins + 1).
+    """
+    boundaries = np.zeros((n_features, n_bins + 1), dtype=np.float32)
+
+    for feat_idx in range(n_features):
+        col = x[:, feat_idx]
+        # Compute quantile boundaries
+        quantile_probs = np.linspace(0, 1, n_bins + 1)
+        boundaries[feat_idx] = np.percentile(col, quantile_probs * 100).astype(np.float32)
+
+    return boundaries
+
+
+def _select_top_features(teacher: xgb.XGBClassifier, n_top: int) -> tuple[list[int], np.ndarray]:
+    """Select top continuous features by XGBoost importance.
+
+    Args:
+        teacher: Fitted XGBoost teacher model
+        n_top: Number of top features to select
+
+    Returns
+    -------
+        Tuple of (feature_indices, importance_scores).
+    """
+    importance = teacher.feature_importances_
+
+    # Sort by importance and get top indices
+    top_indices = np.argsort(importance)[-n_top:][::-1]
+
+    return list(top_indices), importance[top_indices]
 
 
 def _compute_and_save_teacher_targets(
@@ -286,6 +359,33 @@ def run(args: argparse.Namespace) -> None:
     # Compute and save teacher targets
     _compute_and_save_teacher_targets(cache_dir, teacher, train_x, val_x, delta_t)
 
+    # Compute PLE metadata if requested
+    ple_metadata = None
+    if args.preprocess == "ple64":
+        print("\nComputing PLE64 metadata...")
+        # Select top-64 features by XGBoost importance
+        ple_indices, ple_importance = _select_top_features(teacher, PLE64_N_FEATURES)
+        bypass_indices = [i for i in range(train_x.shape[1]) if i not in ple_indices]
+
+        # Compute bin boundaries for PLE features
+        train_x_ple = train_x[:, ple_indices]
+        ple_bin_boundaries = _compute_ple_bin_boundaries(train_x_ple, PLE64_N_FEATURES, PLE64_N_BINS)
+
+        print(f"PLE64: Selected top {PLE64_N_FEATURES} features")
+        print(f"PLE64: Bin boundaries shape: {ple_bin_boundaries.shape}")
+        print(f"PLE64: Output dimension will be {PLE64_OUTPUT_DIM} (266 -> {PLE64_OUTPUT_DIM})")
+
+        ple_metadata = {
+            "n_ple_features": PLE64_N_FEATURES,
+            "n_bins": PLE64_N_BINS,
+            "embedding_dim": PLE64_EMBEDDING_DIM,
+            "output_dim": PLE64_OUTPUT_DIM,
+            "ple_indices": ple_indices,
+            "bypass_indices": bypass_indices,
+            "bin_boundaries": ple_bin_boundaries,
+            "feature_importance": ple_importance,
+        }
+
     # Teacher inference is finished, so the arrays may now be transformed.
     preprocessor, train_x_processed, val_x_processed = _preprocess_features(
         train_x,
@@ -302,6 +402,7 @@ def run(args: argparse.Namespace) -> None:
         val_y,
         preprocessor,
         args.preprocess,
+        ple_metadata,
     )
 
     # Save metadata
@@ -351,7 +452,7 @@ def parse_args() -> argparse.Namespace:
         "--preprocess",
         type=str,
         default="physical",
-        choices=["physical", "quantile", "raw", "robust", "stretch32", "stretch128"],
+        choices=["physical", "quantile", "raw", "robust", "stretch32", "stretch128", "ple64"],
         help="Preprocessing method: physical (log/arcsinh+standardize),"
         " quantile (force N(0,1)), raw (no transform),"
         " robust (median/IQR+tanh clip), stretch32/128 (unsupervised CDF stretch)",

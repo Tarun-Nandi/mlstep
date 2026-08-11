@@ -29,7 +29,12 @@ from mlstep.evaluation import (
     write_json,
 )
 from mlstep.policy import EpsilonPolicy, boundary_probabilities
-from mlstep.tabm import LinearEnsemble, MiniEnsembleInputScaling, SharedMLPBackbone
+from mlstep.tabm import (
+    LinearEnsemble,
+    MiniEnsembleInputScaling,
+    PiecewiseLinearEmbedding,
+    SharedMLPBackbone,
+)
 
 # Default paths
 DEFAULT_OUTPUT_DIR: Final = Path(__file__).resolve().parent / "runs"
@@ -186,7 +191,23 @@ class Student(nn.Module):
         k: int = 1,
         dropout: float = DROPOUT,
         architecture: str = DEFAULT_ARCHITECTURE,
+        ple_config: dict | None = None,
     ) -> None:
+        """Initialize the student model.
+
+        Args:
+            n_features: Number of input features (after PLE if enabled)
+            hidden_layers: Hidden layer widths for the backbone
+            k: Number of ensemble members (1 for MLP, 2+ for TabM-mini)
+            dropout: Dropout rate
+            architecture: 'mlp' or 'tabm-mini'
+            ple_config: Optional PLE configuration dict with keys:
+                - 'n_ple_features': Number of features to apply PLE to (e.g., 64)
+                - 'n_bins': Number of quantile bins (default: 48)
+                - 'embedding_dim': Embedding dimension (default: 12)
+                - 'ple_indices': Indices of features to apply PLE to
+                - 'bypass_indices': Indices of features to bypass PLE
+        """
         super().__init__()
         if architecture not in ARCHITECTURES:
             msg = f"architecture must be one of {ARCHITECTURES}"
@@ -212,9 +233,35 @@ class Student(nn.Module):
         self.n_features = n_features
         self.hidden_layers = tuple(hidden_layers)
         self.dropout = dropout
+        self.ple_config = ple_config or {}
+
+        # Initialize PLE layer if config provided
+        self.ple: nn.Module | None = None
+        self.ple_n_embedded_features = 0
+        self.ple_n_bypass_features = 0
+        self.ple_output_dim = n_features  # Default: no expansion
+
+        if ple_config is not None:
+            n_ple_features = ple_config.get("n_ple_features", 0)
+            n_bins = ple_config.get("n_bins", 48)
+            embedding_dim = ple_config.get("embedding_dim", 12)
+
+            if n_ple_features > 0:
+                self.ple = PiecewiseLinearEmbedding(
+                    n_features=n_ple_features,
+                    n_bins=n_bins,
+                    embedding_dim=embedding_dim,
+                    version="B",
+                )
+                self.ple_n_embedded_features = n_ple_features
+                self.ple_n_bypass_features = n_features - n_ple_features
+                self.ple_output_dim = n_ple_features * embedding_dim + self.ple_n_bypass_features
+
+        # Input scaling applies to the PLE output (or raw features if no PLE)
+        effective_n_features = self.ple_output_dim
 
         self.backbone = SharedMLPBackbone(
-            n_features,
+            effective_n_features,
             hidden_layers,
             dropout,
         )
@@ -224,15 +271,46 @@ class Student(nn.Module):
             self.detector_head: nn.Module = nn.Linear(hidden_layers[-1], 1)
             self.severity_head: nn.Module = nn.Linear(hidden_layers[-1], N_SEVERITY_CLASSES)
         else:
-            self.input_scaling = MiniEnsembleInputScaling(k, n_features)
+            self.input_scaling = MiniEnsembleInputScaling(k, effective_n_features)
             self.detector_head = LinearEnsemble(hidden_layers[-1], 1, k=k)
             self.severity_head = LinearEnsemble(hidden_layers[-1], N_SEVERITY_CLASSES, k=k)
 
     def forward_logits(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return member logits without computing unused training probabilities."""
-        if x.ndim != MATRIX_NDIM or x.shape[1] != self.n_features:
-            msg = f"Student expects shape (batch, {self.n_features}), received {tuple(x.shape)}"
+        """Return member logits without computing unused training probabilities.
+
+        If PLE is enabled, input should have raw features (n_features) and will
+        be expanded internally to ple_output_dim before the backbone.
+        """
+        if x.ndim != MATRIX_NDIM:
+            msg = f"Input must be 2D, got shape {tuple(x.shape)}"
             raise ValueError(msg)
+
+        # Validate input dimension - allow both raw features (n_features) and
+        # pre-embedded (ple_output_dim) for flexibility
+        if x.shape[1] not in (self.n_features, self.ple_output_dim):
+            msg = (
+                f"Student expects shape (batch, {self.n_features}) or "
+                f"(batch, {self.ple_output_dim}), received {tuple(x.shape)}"
+            )
+            raise ValueError(msg)
+
+        # Apply PLE if input is raw features and PLE is enabled
+        if self.ple is not None and x.shape[1] == self.n_features:
+            ple_indices = self.ple_config.get("ple_indices", list(range(self.ple_n_embedded_features)))
+            bypass_indices = self.ple_config.get(
+                "bypass_indices",
+                list(range(self.ple_n_embedded_features, self.n_features)),
+            )
+
+            # Split features into PLE and bypass
+            x_ple = x[:, ple_indices]
+            x_bypass = x[:, bypass_indices]
+
+            # Apply PLE embedding
+            ple_embedded = self.ple(x_ple)
+
+            # Concatenate embedded and bypass features
+            x = torch.cat([ple_embedded, x_bypass], dim=1)
 
         if self.architecture == "mlp":
             representation = self.backbone(x)
@@ -282,6 +360,29 @@ class Student(nn.Module):
             raise RuntimeError(msg)
         with torch.no_grad():
             bias.fill_(population_log_odds)
+
+    def set_ple_bin_boundaries(self, boundaries: np.ndarray | torch.Tensor) -> None:
+        """Set PLE bin boundaries from preprocessing.
+
+        Args:
+            boundaries: Array/tensor of shape (n_ple_features, n_bins + 1)
+        """
+        if self.ple is None:
+            msg = "Model was not initialized with PLE"
+            raise RuntimeError(msg)
+        if not isinstance(boundaries, (np.ndarray, torch.Tensor)):
+            msg = "boundaries must be a numpy array or torch tensor"
+            raise TypeError(msg)
+
+        if isinstance(boundaries, np.ndarray):
+            boundaries = torch.from_numpy(boundaries).float()
+
+        expected_shape = (self.ple_n_embedded_features, self.ple.n_bins + 1)
+        if boundaries.shape != expected_shape:
+            msg = f"Expected boundaries shape {expected_shape}, got {boundaries.shape}"
+            raise ValueError(msg)
+
+        self.ple.set_bin_boundaries(boundaries)
 
 
 def student_from_checkpoint(checkpoint: dict) -> Student:
@@ -1624,6 +1725,27 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         del train_x_host, val_x_host
     print(f"Feature cache residency: {cache_residency}", flush=True)
 
+    # Load PLE config if using PLE64 preprocessing
+    ple_config = None
+    if args.preprocess == "ple64":
+        ple_metadata_path = cache_dir / "ple_metadata.npz"
+        if not ple_metadata_path.exists():
+            msg = f"PLE metadata not found at {ple_metadata_path}. Run cache generation first."
+            raise FileNotFoundError(msg)
+
+        print("Loading PLE64 metadata...")
+        ple_data = np.load(ple_metadata_path)
+        ple_config = {
+            "n_ple_features": int(ple_data["n_ple_features"]),
+            "n_bins": int(ple_data["n_bins"]),
+            "embedding_dim": int(ple_data["embedding_dim"]),
+            "ple_indices": ple_data["ple_indices"].tolist(),
+            "bypass_indices": ple_data["bypass_indices"].tolist(),
+        }
+        embedded_dims = ple_config["n_ple_features"] * ple_config["embedding_dim"]
+        print(f"PLE64: {ple_config['n_ple_features']} features -> {embedded_dims} embedded dims")
+        print(f"PLE64: Output dimension will be {ple_data['output_dim']}")
+
     # Create model
     model = Student(
         n_features=train_x.shape[1],
@@ -1631,9 +1753,24 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         k=args.members,
         dropout=args.dropout,
         architecture=args.architecture,
+        ple_config=ple_config,
     )
     model.initialize_detector_bias(initial_detector_bias)
+
+    # Set PLE bin boundaries if using PLE64
+    if ple_config is not None:
+        ple_metadata_path = cache_dir / "ple_metadata.npz"
+        ple_data = np.load(ple_metadata_path)
+        bin_boundaries = ple_data["bin_boundaries"]
+        model.set_ple_bin_boundaries(bin_boundaries)
+        print("PLE64: Bin boundaries set successfully")
+
     model = model.to(device)
+
+    # Reduce eval batch size for PLE64 due to larger feature dimension
+    if args.preprocess == "ple64":
+        args.eval_batch_size = min(args.eval_batch_size, 16384)
+        print(f"PLE64: Reduced eval batch size to {args.eval_batch_size} for larger feature dimension")
 
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
