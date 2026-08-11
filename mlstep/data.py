@@ -373,6 +373,192 @@ class StretchPreprocesser:
         }
 
 
+FittedPreprocesser = Preprocesser | RobustPreprocesser | StretchPreprocesser
+_PHYSICAL_STATE_KEYS = frozenset({"scale", "mean", "std", "features"})
+_ROBUST_STATE_KEYS = frozenset(
+    {
+        "scale",
+        "median",
+        "iqr",
+        "clip_threshold",
+        "features",
+        "fit_sample_rows",
+        "fit_sample_max_rows",
+        "fit_sample_seed",
+        "quantile_method",
+    }
+)
+_STRETCH_STATE_KEYS = frozenset(
+    {
+        "scale",
+        "quantiles",
+        "n_bins",
+        "mean",
+        "std",
+        "features",
+        "fit_sample_rows",
+        "fit_sample_max_rows",
+        "fit_sample_seed",
+        "quantile_method",
+    }
+)
+
+
+def _validate_feature_state(raw_features: np.ndarray, features: tuple[Feature, ...]) -> int:
+    """Validate and count the exact feature layout recorded in a state file."""
+    if not features or any(not isinstance(feature, Feature) for feature in features):
+        msg = "features must be a non-empty tuple of Feature objects"
+        raise ValueError(msg)
+    if any(
+        isinstance(feature.channels, bool)
+        or not isinstance(feature.channels, int)
+        or feature.channels < 1
+        or feature.transform not in {"standard", "log1p", "arcsinh"}
+        for feature in features
+    ):
+        msg = "features contain an invalid channel count or transform"
+        raise ValueError(msg)
+
+    if raw_features.shape != (len(features),) or raw_features.dtype != np.dtype(object):
+        msg = "preprocessor feature metadata has the wrong shape or dtype"
+        raise ValueError(msg)
+    saved_features = raw_features.tolist()
+    expected_features = [
+        {"name": feature.name, "channels": feature.channels, "transform": feature.transform} for feature in features
+    ]
+    if any(not isinstance(feature, dict) for feature in saved_features) or saved_features != expected_features:
+        msg = "preprocessor feature metadata does not match the requested feature layout"
+        raise ValueError(msg)
+    return sum(feature.channels for feature in features)
+
+
+def _load_float_state_array(
+    state: np.lib.npyio.NpzFile,
+    name: str,
+    shape: tuple[int, ...],
+    *,
+    positive: bool = False,
+) -> np.ndarray:
+    """Load one finite floating-point state array with its required shape."""
+    value = np.asarray(state[name])
+    if value.shape != shape or not np.issubdtype(value.dtype, np.floating):
+        msg = f"preprocessor state {name!r} must be a floating-point array with shape {shape}"
+        raise ValueError(msg)
+    value = np.array(value, dtype=np.float32, copy=True)
+    if not np.isfinite(value).all():
+        msg = f"preprocessor state {name!r} must contain only finite values"
+        raise ValueError(msg)
+    if positive and np.any(value <= 0.0):
+        msg = f"preprocessor state {name!r} must contain only positive values"
+        raise ValueError(msg)
+    return value
+
+
+def _load_integer_state_scalar(state: np.lib.npyio.NpzFile, name: str) -> int:
+    """Load one integer saved using the state-file scalar convention."""
+    value = np.asarray(state[name])
+    if value.shape != (1,) or not np.issubdtype(value.dtype, np.integer):
+        msg = f"preprocessor state {name!r} must be a one-element integer array"
+        raise ValueError(msg)
+    return int(value[0])
+
+
+def _validate_quantile_fit_state(state: np.lib.npyio.NpzFile) -> int:
+    """Validate shared provenance for sampled training-only quantile fits."""
+    sample_rows = _load_integer_state_scalar(state, "fit_sample_rows")
+    max_rows = _load_integer_state_scalar(state, "fit_sample_max_rows")
+    seed = _load_integer_state_scalar(state, "fit_sample_seed")
+    method = np.asarray(state["quantile_method"])
+    if method.shape != () or not np.issubdtype(method.dtype, np.str_) or str(method) != "linear":
+        msg = "preprocessor state 'quantile_method' must be the scalar string 'linear'"
+        raise ValueError(msg)
+    if max_rows != QUANTILE_FIT_SAMPLE_ROWS or seed != QUANTILE_FIT_SEED:
+        msg = "preprocessor quantile-fit cap or seed does not match the supported training protocol"
+        raise ValueError(msg)
+    if not 1 <= sample_rows <= max_rows:
+        msg = "preprocessor state 'fit_sample_rows' must be in the supported sample range"
+        raise ValueError(msg)
+    return sample_rows
+
+
+def load_fitted_preprocessor(
+    state_path: Path,
+    method: str,
+    *,
+    features: tuple[Feature, ...] = FEATURES,
+) -> FittedPreprocesser:
+    """Load a saved train-fitted transform for held-out raw feature matrices.
+
+    Parameters
+    ----------
+    state_path
+        Path to the ``preprocessor_state.npz`` artifact written by the cache builder.
+    method
+        The cache preprocessing method: ``physical``, ``ple64``, ``robust``,
+        ``stretch32`` or ``stretch128``.
+    features
+        Expected ordered raw-feature specification. The saved specification must
+        match exactly, preventing a transform from being applied to reordered data.
+
+    Returns
+    -------
+    FittedPreprocesser
+        A transform reconstructed solely from training-fitted state. Calling
+        ``transform`` does not fit or update any statistics.
+    """
+    supported_methods = {"physical", "ple64", "robust", "stretch32", "stretch128"}
+    if method not in supported_methods:
+        msg = f"cannot load fitted preprocessing state for method {method!r}"
+        raise ValueError(msg)
+
+    path = Path(state_path)
+    with np.load(path, allow_pickle=True) as state:
+        expected_keys = _PHYSICAL_STATE_KEYS
+        if method == "robust":
+            expected_keys = _ROBUST_STATE_KEYS
+        elif method.startswith("stretch"):
+            expected_keys = _STRETCH_STATE_KEYS
+        actual_keys = frozenset(state.files)
+        if actual_keys != expected_keys:
+            missing = sorted(expected_keys - actual_keys)
+            unexpected = sorted(actual_keys - expected_keys)
+            msg = f"preprocessor state schema mismatch: missing={missing}, unexpected={unexpected}"
+            raise ValueError(msg)
+
+        feature_tuple = tuple(features)
+        n_features = _validate_feature_state(state["features"], feature_tuple)
+        vector_shape = (n_features,)
+        scale = _load_float_state_array(state, "scale", vector_shape, positive=True)
+
+        if method in {"physical", "ple64"}:
+            mean = _load_float_state_array(state, "mean", vector_shape)
+            std = _load_float_state_array(state, "std", vector_shape, positive=True)
+            return Preprocesser(scale, mean, std, feature_tuple)
+
+        sample_rows = _validate_quantile_fit_state(state)
+        if method == "robust":
+            median = _load_float_state_array(state, "median", vector_shape)
+            iqr = _load_float_state_array(state, "iqr", vector_shape, positive=True)
+            clip = _load_float_state_array(state, "clip_threshold", (1,))
+            if clip[0] < 0.0:
+                msg = "preprocessor state 'clip_threshold' must be non-negative"
+                raise ValueError(msg)
+            return RobustPreprocesser(scale, median, iqr, float(clip[0]), feature_tuple, sample_rows)
+
+        n_bins = _load_integer_state_scalar(state, "n_bins")
+        expected_n_bins = int(method.removeprefix("stretch"))
+        if n_bins != expected_n_bins or n_bins < MIN_STRETCH_BINS:
+            msg = f"preprocessor state n_bins={n_bins} is inconsistent with method {method!r}"
+            raise ValueError(msg)
+        quantiles = _load_float_state_array(state, "quantiles", (n_bins + 1, n_features))
+        if np.any(np.diff(quantiles, axis=0) < 0.0):
+            msg = "preprocessor state quantiles must be nondecreasing in every feature"
+            raise ValueError(msg)
+        mean = _load_float_state_array(state, "mean", vector_shape)
+        std = _load_float_state_array(state, "std", vector_shape, positive=True)
+        return StretchPreprocesser(scale, quantiles, n_bins, feature_tuple, mean, std, sample_rows)
+
+
 def chunks(x: np.ndarray):
     """Split the data into chunks for faster preprocessing."""
     for start in range(0, len(x), CHUNK_SIZE):

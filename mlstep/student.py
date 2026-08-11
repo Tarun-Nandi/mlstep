@@ -1742,6 +1742,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         "lambda_sev": DEFAULT_LAMBDA_SEV,
         "kd_temperature": DEFAULT_KD_TEMPERATURE,
         "save_ap_best_checkpoint": False,
+        "save_fp97_best_checkpoint": False,
     }
     for name, default in backward_compatible_defaults.items():
         if not hasattr(args, name):
@@ -1980,6 +1981,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
     best_ap_state = None
     best_fp_selection_key = None
     best_fp97_epoch = None
+    best_fp97_state = None
     history = []
 
     print(f"\nTraining for {args.epochs} epochs with patience {args.patience}")
@@ -1993,6 +1995,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
     print(f"Post-checkpoint target detector recall: {args.target_recall:.1%}")
     print(f"Checkpoint policy: {SELECTION_POLICY}")
     print(f"Save AP-best diagnostic checkpoint: {args.save_ap_best_checkpoint}")
+    print(f"Save FP@97-best diagnostic checkpoint: {args.save_fp97_best_checkpoint}")
 
     for epoch in range(1, args.epochs + 1):
         epoch_start = time.perf_counter()
@@ -2151,6 +2154,8 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         if best_fp_selection_key is None or fp_selection_key > best_fp_selection_key:
             best_fp_selection_key = fp_selection_key
             best_fp97_epoch = epoch
+            if args.save_fp97_best_checkpoint:
+                best_fp97_state = {name: value.cpu().clone() for name, value in model.state_dict().items()}
 
         # Early stopping
         if best_selection_key is None or selection_key > best_selection_key:
@@ -2184,6 +2189,9 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         raise RuntimeError(msg)
     if args.save_ap_best_checkpoint and best_ap_state is None:
         msg = "AP-best checkpoint saving was enabled but no state was captured"
+        raise RuntimeError(msg)
+    if args.save_fp97_best_checkpoint and best_fp97_state is None:
+        msg = "FP@97-best checkpoint saving was enabled but no state was captured"
         raise RuntimeError(msg)
     model.load_state_dict(best_state)
     restored_state = model.state_dict()
@@ -2276,6 +2284,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
     artifact_name = f"student_{architecture_slug}_k{args.members}_{task}_seed{args.seed}"
     model_path, result_path = output_paths(args.output_dir, artifact_name, ".pt")
     ap_model_path = model_path.with_name(f"{model_path.stem}_ap_best{model_path.suffix}")
+    fp97_model_path = model_path.with_name(f"{model_path.stem}_fp97_best{model_path.suffix}")
     checkpoint_config = {
         **model_metadata,
         "delta_s": delta_s,
@@ -2292,7 +2301,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
                 "exact normalized area of precision under the kth-positive threshold rule "
                 "over requested recall targets [0.95, 0.99]"
             ),
-            "checkpoint_saved": False,
+            "checkpoint_saved": bool(args.save_fp97_best_checkpoint),
         },
     }
     ap_history_row = next(row for row in history if row["epoch"] == best_ap_epoch)
@@ -2313,10 +2322,23 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
     }
 
     fp97_history_row = next(row for row in history if row["epoch"] == best_fp97_epoch)
+    fp97_threshold = float(fp97_history_row["threshold_at_97"])
+    fp97_achieved_recall = float(fp97_history_row["achieved_recall_at_97"])
+    fp97_threshold_source = "selected with FP@97 diagnostic checkpoint on validation set"
+    fp97_threshold_policy = {
+        "rule": THRESHOLD_RULE,
+        "score": THRESHOLD_SCORE,
+        "split": "validation",
+        "selected_after_checkpoint": False,
+        "selected_with_checkpoint": True,
+        "target_recall": 0.97,
+        "threshold": fp97_threshold,
+        "achieved_recall": fp97_achieved_recall,
+    }
     fp97_metadata = {
-        "enabled": True,
-        "saved": False,
-        "path": None,
+        "enabled": FP_DIAGNOSTIC_ENABLED,
+        "saved": bool(args.save_fp97_best_checkpoint),
+        "path": fp97_model_path.name if args.save_fp97_best_checkpoint else None,
         "policy": FP_SELECTION_POLICY,
         "canonical": False,
         "uses_hard_actions": True,
@@ -2327,6 +2349,8 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         "validation_fp_at_95": int(fp97_history_row["fp_at_95"]),
         "validation_fp_at_97": int(fp97_history_row["fp_at_97"]),
         "validation_fp_at_99": int(fp97_history_row["fp_at_99"]),
+        "validation_threshold_at_97": fp97_threshold,
+        "validation_achieved_recall_at_97": fp97_achieved_recall,
         "validation_precision_at_95": float(fp97_history_row["precision_at_95"]),
         "validation_precision_at_97": float(fp97_history_row["precision_at_97"]),
         "validation_precision_at_99": float(fp97_history_row["precision_at_99"]),
@@ -2336,6 +2360,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
             "exact normalized area of precision under the kth-positive threshold rule "
             "over requested recall targets [0.95, 0.99]"
         ),
+        "threshold_policy": fp97_threshold_policy,
         "same_epoch_as_canonical": best_fp97_epoch == best_epoch,
         "same_epoch_as_ap_best": best_fp97_epoch == best_ap_epoch,
     }
@@ -2378,6 +2403,30 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
             },
             ap_model_path,
         )
+    if args.save_fp97_best_checkpoint:
+        if best_fp97_state is None:
+            msg = "FP@97-best checkpoint state unexpectedly missing during save"
+            raise RuntimeError(msg)
+        torch.save(
+            {
+                "format_version": MODEL_FORMAT_VERSION,
+                "checkpoint_role": "diagnostic",
+                "diagnostic_name": "fp97_best",
+                "state_dict": best_fp97_state,
+                "config": checkpoint_config,
+                "threshold": fp97_threshold,
+                "threshold_source": fp97_threshold_source,
+                "target_recall": 0.97,
+                "severity_decision": SEVERITY_DECISION,
+                "selection": fp97_metadata,
+                "threshold_policy": fp97_threshold_policy,
+                "canonical_selection_policy": SELECTION_POLICY,
+                "objective": objective,
+                "training_protocol": training_protocol,
+                "source_report": result_path.name,
+            },
+            fp97_model_path,
+        )
 
     result = {
         "model_format_version": MODEL_FORMAT_VERSION,
@@ -2415,6 +2464,8 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
     print(f"\nSaved model: {model_path}")
     if args.save_ap_best_checkpoint:
         print(f"Saved AP-best diagnostic model: {ap_model_path}")
+    if args.save_fp97_best_checkpoint:
+        print(f"Saved FP@97-best diagnostic model: {fp97_model_path}")
     print(f"Saved results: {result_path}")
     print(f"Final AP: {final_metrics['ap']:.4f}")
     print(
@@ -2540,6 +2591,14 @@ def parse_args() -> argparse.Namespace:
         "--save-ap-best-checkpoint",
         action="store_true",
         help="Also save an AP-selected diagnostic checkpoint without changing canonical early stopping",
+    )
+    parser.add_argument(
+        "--save-fp97-best-checkpoint",
+        action="store_true",
+        help=(
+            "Also save the FP@97-selected diagnostic checkpoint and its validation-fitted threshold "
+            "without changing canonical early stopping"
+        ),
     )
 
     # Misc
