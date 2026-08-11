@@ -9,6 +9,7 @@ import argparse
 import json
 import time
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path
 from typing import Final
 
@@ -119,6 +120,22 @@ POLICY_DIAGNOSTIC_RECALLS: Final = (0.80, 0.90, 0.95, 0.97, 0.99, 1.0)
 # FP@97-aligned diagnostics. These track the operational objective directly.
 FP_RECALL_TARGETS: Final = (0.95, 0.97, 0.99)
 FP_DIAGNOSTIC_ENABLED: Final = True
+FP_SELECTION_POLICY: Final = "fp97-tail-precision-diagnostic-v1"
+FP_SELECTION_CRITERIA: Final = (
+    "minimize false positives at the threshold achieving at least 97% recall",
+    "maximize mean precision over target recalls 95%-99% (tie-breaker)",
+    "minimize false positives at 95% recall (tie-breaker)",
+    "minimize false positives at 99% recall (tie-breaker)",
+)
+PREPROCESS_VARIANTS: Final = (
+    "physical",
+    "robust",
+    "stretch32",
+    "stretch128",
+    "quantile",
+    "ple64",
+    "raw",
+)
 
 FeatureMatrix = np.ndarray | torch.Tensor
 
@@ -174,6 +191,71 @@ class PreparedEpoch:
     staging_seconds: float
 
 
+def _normalized_ple_config(n_features: int, ple_config: dict | None) -> dict | None:
+    """Validate and JSON-normalize an optional PLE feature partition."""
+    if ple_config is None:
+        return None
+    if not isinstance(ple_config, dict):
+        msg = "ple_config must be a dictionary or None"
+        raise TypeError(msg)
+    required = {"n_ple_features", "n_bins", "embedding_dim", "ple_indices", "bypass_indices"}
+    missing = sorted(required - ple_config.keys())
+    if missing:
+        msg = f"ple_config is missing: {', '.join(missing)}"
+        raise ValueError(msg)
+
+    integer_fields = {}
+    for name in ("n_ple_features", "n_bins", "embedding_dim"):
+        value = ple_config[name]
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or int(value) < 1:
+            msg = f"ple_config {name} must be a positive integer"
+            raise ValueError(msg)
+        integer_fields[name] = int(value)
+
+    def indices(name: str) -> list[int]:
+        values = ple_config[name]
+        if not isinstance(values, (list, tuple, np.ndarray)):
+            msg = f"ple_config {name} must be a sequence"
+            raise TypeError(msg)
+        normalized = []
+        for value in values:
+            if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+                msg = f"ple_config {name} must contain integer indices"
+                raise ValueError(msg)
+            normalized.append(int(value))
+        if len(set(normalized)) != len(normalized):
+            msg = f"ple_config {name} must not contain duplicates"
+            raise ValueError(msg)
+        if any(value < 0 or value >= n_features for value in normalized):
+            msg = f"ple_config {name} contains an out-of-range index"
+            raise ValueError(msg)
+        return normalized
+
+    ple_indices = indices("ple_indices")
+    bypass_indices = indices("bypass_indices")
+    if len(ple_indices) != integer_fields["n_ple_features"]:
+        msg = "ple_config n_ple_features does not match ple_indices"
+        raise ValueError(msg)
+    if set(ple_indices) & set(bypass_indices):
+        msg = "ple_config embedded and bypass indices must be disjoint"
+        raise ValueError(msg)
+    if set(ple_indices) | set(bypass_indices) != set(range(n_features)):
+        msg = "ple_config embedded and bypass indices must partition all input features"
+        raise ValueError(msg)
+
+    version = ple_config.get("version", "B")
+    if version not in ("A", "B"):
+        msg = "ple_config version must be 'A' or 'B'"
+        raise ValueError(msg)
+    return {
+        **integer_fields,
+        "version": version,
+        "encoding_version": str(ple_config.get("encoding_version", "piecewise-linear-encoding-linear-projection-v1")),
+        "ple_indices": ple_indices,
+        "bypass_indices": bypass_indices,
+    }
+
+
 class Student(nn.Module):
     """Matched MLP or faithful TabM-mini two-head student.
 
@@ -184,7 +266,7 @@ class Student(nn.Module):
     backbone, and uses independent member heads.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0915
         self,
         n_features: int,
         hidden_layers: list[int] | None = None,
@@ -196,7 +278,7 @@ class Student(nn.Module):
         """Initialize the student model.
 
         Args:
-            n_features: Number of input features (after PLE if enabled)
+            n_features: Number of cached scalar input features before optional PLE
             hidden_layers: Hidden layer widths for the backbone
             k: Number of ensemble members (1 for MLP, 2+ for TabM-mini)
             dropout: Dropout rate
@@ -207,6 +289,7 @@ class Student(nn.Module):
                 - 'embedding_dim': Embedding dimension (default: 12)
                 - 'ple_indices': Indices of features to apply PLE to
                 - 'bypass_indices': Indices of features to bypass PLE
+                - 'version': Numerical embedding version, ``A`` or ``B``
         """
         super().__init__()
         if architecture not in ARCHITECTURES:
@@ -233,7 +316,7 @@ class Student(nn.Module):
         self.n_features = n_features
         self.hidden_layers = tuple(hidden_layers)
         self.dropout = dropout
-        self.ple_config = ple_config or {}
+        self.ple_config = _normalized_ple_config(n_features, ple_config)
 
         # Initialize PLE layer if config provided
         self.ple: nn.Module | None = None
@@ -241,21 +324,19 @@ class Student(nn.Module):
         self.ple_n_bypass_features = 0
         self.ple_output_dim = n_features  # Default: no expansion
 
-        if ple_config is not None:
-            n_ple_features = ple_config.get("n_ple_features", 0)
-            n_bins = ple_config.get("n_bins", 48)
-            embedding_dim = ple_config.get("embedding_dim", 12)
-
-            if n_ple_features > 0:
-                self.ple = PiecewiseLinearEmbedding(
-                    n_features=n_ple_features,
-                    n_bins=n_bins,
-                    embedding_dim=embedding_dim,
-                    version="B",
-                )
-                self.ple_n_embedded_features = n_ple_features
-                self.ple_n_bypass_features = n_features - n_ple_features
-                self.ple_output_dim = n_ple_features * embedding_dim + self.ple_n_bypass_features
+        if self.ple_config is not None:
+            n_ple_features = self.ple_config["n_ple_features"]
+            n_bins = self.ple_config["n_bins"]
+            embedding_dim = self.ple_config["embedding_dim"]
+            self.ple = PiecewiseLinearEmbedding(
+                n_features=n_ple_features,
+                n_bins=n_bins,
+                embedding_dim=embedding_dim,
+                version=self.ple_config["version"],
+            )
+            self.ple_n_embedded_features = n_ple_features
+            self.ple_n_bypass_features = len(self.ple_config["bypass_indices"])
+            self.ple_output_dim = self.ple.output_dim + self.ple_n_bypass_features
 
         # Input scaling applies to the PLE output (or raw features if no PLE)
         effective_n_features = self.ple_output_dim
@@ -271,7 +352,21 @@ class Student(nn.Module):
             self.detector_head: nn.Module = nn.Linear(hidden_layers[-1], 1)
             self.severity_head: nn.Module = nn.Linear(hidden_layers[-1], N_SEVERITY_CLASSES)
         else:
-            self.input_scaling = MiniEnsembleInputScaling(k, effective_n_features)
+            if self.ple_config is None:
+                self.input_scaling = MiniEnsembleInputScaling(k, effective_n_features)
+            else:
+                # TabM's embedding-aware initialization draws one normal value
+                # per original feature representation and repeats it across
+                # that feature's embedding coordinates. Coordinates become
+                # independently trainable immediately after initialization.
+                feature_sizes = [self.ple_config["embedding_dim"]] * self.ple_n_embedded_features
+                feature_sizes.extend([1] * self.ple_n_bypass_features)
+                self.input_scaling = MiniEnsembleInputScaling(
+                    k,
+                    effective_n_features,
+                    initialization="normal",
+                    feature_sizes=feature_sizes,
+                )
             self.detector_head = LinearEnsemble(hidden_layers[-1], 1, k=k)
             self.severity_head = LinearEnsemble(hidden_layers[-1], N_SEVERITY_CLASSES, k=k)
 
@@ -285,22 +380,13 @@ class Student(nn.Module):
             msg = f"Input must be 2D, got shape {tuple(x.shape)}"
             raise ValueError(msg)
 
-        # Validate input dimension - allow both raw features (n_features) and
-        # pre-embedded (ple_output_dim) for flexibility
-        if x.shape[1] not in (self.n_features, self.ple_output_dim):
-            msg = (
-                f"Student expects shape (batch, {self.n_features}) or "
-                f"(batch, {self.ple_output_dim}), received {tuple(x.shape)}"
-            )
+        if x.shape[1] != self.n_features:
+            msg = f"Student expects shape (batch, {self.n_features}), received {tuple(x.shape)}"
             raise ValueError(msg)
 
-        # Apply PLE if input is raw features and PLE is enabled
-        if self.ple is not None and x.shape[1] == self.n_features:
-            ple_indices = self.ple_config.get("ple_indices", list(range(self.ple_n_embedded_features)))
-            bypass_indices = self.ple_config.get(
-                "bypass_indices",
-                list(range(self.ple_n_embedded_features, self.n_features)),
-            )
+        if self.ple is not None:
+            ple_indices = self.ple_config["ple_indices"]
+            bypass_indices = self.ple_config["bypass_indices"]
 
             # Split features into PLE and bypass
             x_ple = x[:, ple_indices]
@@ -317,8 +403,8 @@ class Student(nn.Module):
             d_logit = self.detector_head(representation).squeeze(-1).unsqueeze(0)
             s_logits = self.severity_head(representation).unsqueeze(0)
         else:
-            # A copy-free view becomes K distinct representations through the
-            # random-sign trainable scaling before any features are mixed.
+            # A copy-free view becomes K distinct representations through
+            # trainable scaling before any features are mixed.
             member_inputs = x.unsqueeze(1).expand(-1, self.k, -1)
             member_inputs = self.input_scaling(member_inputs)
             representation = self.backbone(member_inputs)
@@ -425,6 +511,7 @@ def student_from_checkpoint(checkpoint: dict) -> Student:
         k=config["k"],
         dropout=config["dropout"],
         architecture=architecture,
+        ple_config=config.get("ple_config"),
     )
     model.load_state_dict(state_dict, strict=True)
     return model
@@ -1340,62 +1427,82 @@ def fp_recall_diagnostics(
     labels: np.ndarray,
     recall_targets: tuple[float, ...] = FP_RECALL_TARGETS,
 ) -> dict:
-    """Compute FP count and precision at multiple recall levels.
-
-    Returns a dict with keys like 'fp_at_95', 'precision_at_95', etc.
-    Also computes partial PR-AUC over the 95-99% recall region.
-    """
-    detector_probability = np.asarray(detector_probability)
+    """Compute exact fixed-recall FP diagnostics without repeatedly scanning negatives."""
+    detector_probability = np.asarray(detector_probability, dtype=np.float64)
     labels = np.asarray(labels)
+    if detector_probability.ndim != 1 or labels.ndim != 1 or len(detector_probability) != len(labels):
+        msg = "detector_probability and labels must be matching one-dimensional arrays"
+        raise ValueError(msg)
+    if not np.isfinite(detector_probability).all():
+        msg = "detector_probability must contain only finite values"
+        raise ValueError(msg)
+    if any(not np.isfinite(recall) or not 0.0 < recall <= 1.0 for recall in recall_targets):
+        msg = "recall targets must be finite and in (0, 1]"
+        raise ValueError(msg)
+
     positive = labels > 0
     positive_scores = detector_probability[positive]
-
     if not len(positive_scores):
-        return {f"fp_at_{int(r * 100)}": -1 for r in recall_targets}
+        msg = "at least one positive label is required for fixed-recall diagnostics"
+        raise ValueError(msg)
 
-    # Sort positive scores in descending order for threshold calculation
     positive_scores_sorted = np.sort(positive_scores)[::-1]
+    negative_scores_sorted = np.sort(detector_probability[~positive])
+    n_positive = len(positive_scores_sorted)
+    n_negative = len(negative_scores_sorted)
 
-    result = {}
+    def operating_point(recall: float) -> tuple[float, int, int, float, float]:
+        required = min(int(np.ceil(recall * n_positive)), n_positive)
+        threshold = float(positive_scores_sorted[required - 1])
+        # >= is the same comparison used by the deployed threshold rule. Ties
+        # can make achieved recall exceed the requested target.
+        true_positive = int(np.count_nonzero(positive_scores >= threshold))
+        first_detected_negative = int(np.searchsorted(negative_scores_sorted, threshold, side="left"))
+        false_positive = n_negative - first_detected_negative
+        achieved_recall = true_positive / n_positive
+        precision = true_positive / (true_positive + false_positive)
+        return threshold, true_positive, false_positive, achieved_recall, precision
 
-    # Compute FP and precision at each recall target
+    result: dict[str, float | int] = {}
     for recall in recall_targets:
-        required = int(np.ceil(recall * len(positive_scores)))
-        threshold = float(positive_scores_sorted[required - 1])
+        threshold, true_positive, false_positive, achieved_recall, precision = operating_point(recall)
+        suffix = round(recall * 100)
+        result[f"threshold_at_{suffix}"] = threshold
+        result[f"tp_at_{suffix}"] = true_positive
+        result[f"fp_at_{suffix}"] = false_positive
+        result[f"achieved_recall_at_{suffix}"] = achieved_recall
+        result[f"precision_at_{suffix}"] = precision
 
-        detected = detector_probability >= threshold
-        true_positive = int((detected & positive).sum())
-        false_positive = int((detected & ~positive).sum())
-
-        result[f"fp_at_{int(recall * 100)}"] = false_positive
-        result[f"precision_at_{int(recall * 100)}"] = (
-            true_positive / (true_positive + false_positive) if (true_positive + false_positive) > 0 else 0.0
-        )
-
-    # Compute partial PR-AUC over 95-99% recall region
-    # Use dense recall points for stability
-    n_recall_points = 50
-    recall_grid = np.linspace(0.95, 0.99, n_recall_points)
-
-    # Get precision at each recall point
-    precisions = []
-    for recall in recall_grid:
-        required = int(np.ceil(recall * len(positive_scores)))
-        required = min(required, len(positive_scores))
-        threshold = float(positive_scores_sorted[required - 1])
-
-        detected = detector_probability >= threshold
-        true_positive = int((detected & positive).sum())
-        false_positive = int((detected & ~positive).sum())
-
-        precision = true_positive / (true_positive + false_positive) if (true_positive + false_positive) > 0 else 0.0
-        precisions.append(precision)
-
-    # Approximate area using trapezoidal rule
-    partial_pr_auc = float(np.trapezoid(precisions, recall_grid) / (0.99 - 0.95))
-    result["partial_pr_auc_95_99"] = partial_pr_auc
+    # Integrate the exact step function induced by the kth-positive threshold
+    # over target recall, rather than a grid approximation. This is an
+    # operational tail summary, not sklearn's global average precision.
+    lower_recall, upper_recall = 0.95, 0.99
+    change_points = [lower_recall]
+    change_points.extend(
+        k / n_positive for k in range(1, n_positive + 1) if lower_recall < k / n_positive < upper_recall
+    )
+    change_points.append(upper_recall)
+    precision_area = 0.0
+    for left, right in pairwise(change_points):
+        midpoint = (left + right) / 2.0
+        precision_area += (right - left) * operating_point(midpoint)[4]
+    mean_tail_precision = precision_area / (upper_recall - lower_recall)
+    result["mean_precision_target_recall_95_99"] = float(mean_tail_precision)
+    # Backward-compatible report key. Its definition is now exact and is
+    # recorded explicitly in diagnostic metadata below.
+    result["partial_pr_auc_95_99"] = float(mean_tail_precision)
 
     return result
+
+
+def fp_checkpoint_selection_key(fp_metrics: dict) -> tuple[float, float, float, float]:
+    """Return the deterministic FP@97-first diagnostic selection key."""
+    return (
+        -float(fp_metrics["fp_at_97"]),
+        float(fp_metrics["mean_precision_target_recall_95_99"]),
+        -float(fp_metrics["fp_at_95"]),
+        -float(fp_metrics["fp_at_99"]),
+    )
 
 
 def epsilon_policy_diagnostic(
@@ -1489,6 +1596,9 @@ def epsilon_policy_diagnostic(
 
 def _validate_model_args(args: argparse.Namespace) -> None:
     """Validate architecture and cache placement settings."""
+    if args.preprocess not in PREPROCESS_VARIANTS:
+        msg = f"preprocess must be one of {PREPROCESS_VARIANTS}"
+        raise ValueError(msg)
     if args.architecture not in ARCHITECTURES:
         msg = f"architecture must be one of {ARCHITECTURES}"
         raise ValueError(msg)
@@ -1686,6 +1796,13 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
     metadata_path = cache_dir / "metadata.json"
     with open(metadata_path) as f:
         metadata = json.load(f)
+    recorded_preprocess = metadata.get("preprocess")
+    if recorded_preprocess is not None and recorded_preprocess != args.preprocess:
+        msg = f"Cache metadata records preprocessing {recorded_preprocess!r}, but the run requested {args.preprocess!r}"
+        raise ValueError(msg)
+    if metadata.get("n_features", train_x_host.shape[1]) != train_x_host.shape[1]:
+        msg = "Cache metadata feature count does not match the feature arrays"
+        raise ValueError(msg)
     delta_t = metadata["teacher"]["delta_t"]
     print(f"Teacher delta_T: {delta_t:.4f}")
 
@@ -1727,6 +1844,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
 
     # Load PLE config if using PLE64 preprocessing
     ple_config = None
+    ple_bin_boundaries = None
     if args.preprocess == "ple64":
         ple_metadata_path = cache_dir / "ple_metadata.npz"
         if not ple_metadata_path.exists():
@@ -1734,17 +1852,31 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
             raise FileNotFoundError(msg)
 
         print("Loading PLE64 metadata...")
-        ple_data = np.load(ple_metadata_path)
-        ple_config = {
-            "n_ple_features": int(ple_data["n_ple_features"]),
-            "n_bins": int(ple_data["n_bins"]),
-            "embedding_dim": int(ple_data["embedding_dim"]),
-            "ple_indices": ple_data["ple_indices"].tolist(),
-            "bypass_indices": ple_data["bypass_indices"].tolist(),
-        }
+        with np.load(ple_metadata_path, allow_pickle=False) as ple_data:
+            ple_config = {
+                "n_ple_features": int(ple_data["n_ple_features"]),
+                "n_bins": int(ple_data["n_bins"]),
+                "embedding_dim": int(ple_data["embedding_dim"]),
+                "version": "B",
+                "encoding_version": str(ple_data["version"].item()),
+                "ple_indices": ple_data["ple_indices"].tolist(),
+                "bypass_indices": ple_data["bypass_indices"].tolist(),
+            }
+            ple_bin_boundaries = np.array(ple_data["bin_boundaries"], dtype=np.float32, copy=True)
+            recorded_output_dim = int(ple_data["output_dim"])
+            coordinate_system = str(ple_data["input_coordinate_system"].item())
+        if coordinate_system != "physical-log-arcsinh-standardized-v1":
+            msg = f"Unsupported PLE input coordinate system: {coordinate_system}"
+            raise ValueError(msg)
+        expected_output_dim = ple_config["n_ple_features"] * ple_config["embedding_dim"] + len(
+            ple_config["bypass_indices"]
+        )
+        if recorded_output_dim != expected_output_dim:
+            msg = "PLE metadata output dimension is inconsistent with its feature partition"
+            raise ValueError(msg)
         embedded_dims = ple_config["n_ple_features"] * ple_config["embedding_dim"]
         print(f"PLE64: {ple_config['n_ple_features']} features -> {embedded_dims} embedded dims")
-        print(f"PLE64: Output dimension will be {ple_data['output_dim']}")
+        print(f"PLE64: Output dimension will be {recorded_output_dim}")
 
     # Create model
     model = Student(
@@ -1759,10 +1891,10 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
 
     # Set PLE bin boundaries if using PLE64
     if ple_config is not None:
-        ple_metadata_path = cache_dir / "ple_metadata.npz"
-        ple_data = np.load(ple_metadata_path)
-        bin_boundaries = ple_data["bin_boundaries"]
-        model.set_ple_bin_boundaries(bin_boundaries)
+        if ple_bin_boundaries is None:
+            msg = "PLE bin boundaries were not loaded"
+            raise RuntimeError(msg)
+        model.set_ple_bin_boundaries(ple_bin_boundaries)
         print("PLE64: Bin boundaries set successfully")
 
     model = model.to(device)
@@ -1784,6 +1916,13 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         "hidden": list(model.hidden_layers),
         "k": model.k,
         "dropout": model.dropout,
+        "preprocess": args.preprocess,
+        "preprocessing": metadata.get("preprocessing"),
+        "effective_n_features": model.ple_output_dim,
+        "ple_config": model.ple_config,
+        "input_scaling_initialization": (
+            model.input_scaling.initialization if model.input_scaling is not None else None
+        ),
         "total_parameters": total_params,
         "trainable_parameters": trainable_params,
         "cache_residency": cache_residency,
@@ -1839,7 +1978,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
     best_ap_selection_key = None
     best_ap_epoch = None
     best_ap_state = None
-    best_fp97 = None
+    best_fp_selection_key = None
     best_fp97_epoch = None
     history = []
 
@@ -1912,6 +2051,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
 
         # Compute FP@97-aligned diagnostics
         fp_metrics = fp_recall_diagnostics(val_detector_probability, val_y)
+        fp_selection_key = fp_checkpoint_selection_key(fp_metrics)
 
         if not all(
             np.isfinite(value)
@@ -1921,6 +2061,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
                 val_rps,
                 val_nll,
                 val_brier,
+                fp_metrics["mean_precision_target_recall_95_99"],
                 *train_result.loss_components.values(),
             )
         ):
@@ -1945,6 +2086,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
                 "validation_brier_score": val_brier,
                 "selection_key": list(selection_key),
                 "ap_selection_key": list(ap_selection_key),
+                "fp_selection_key": list(fp_selection_key),
                 "seconds": epoch_time,
                 "sampled_rows": train_result.sampled_rows,
                 "training_batches": train_result.batches,
@@ -1961,6 +2103,15 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
                     for r in FP_RECALL_TARGETS
                 },
                 "partial_pr_auc_95_99": fp_metrics["partial_pr_auc_95_99"],
+                "mean_precision_target_recall_95_99": fp_metrics["mean_precision_target_recall_95_99"],
+                **{
+                    f"threshold_at_{int(r * 100)}": fp_metrics[f"threshold_at_{int(r * 100)}"]
+                    for r in FP_RECALL_TARGETS
+                },
+                **{
+                    f"achieved_recall_at_{int(r * 100)}": fp_metrics[f"achieved_recall_at_{int(r * 100)}"]
+                    for r in FP_RECALL_TARGETS
+                },
             }
         )
 
@@ -1983,7 +2134,8 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         )
         print(
             f"  FP diagnostics | FP@95 {fp_metrics['fp_at_95']:4d} | FP@97 {fp_metrics['fp_at_97']:4d} | "
-            f"FP@99 {fp_metrics['fp_at_99']:4d} | Partial PR-AUC {fp_metrics['partial_pr_auc_95_99']:.4f}"
+            f"FP@99 {fp_metrics['fp_at_99']:4d} | "
+            f"mean P@target-R 95-99 {fp_metrics['mean_precision_target_recall_95_99']:.4f}"
         )
 
         # AP is tracked independently for an opt-in ranking diagnostic. It
@@ -1996,9 +2148,8 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
 
         # FP@97 is tracked as a diagnostic for the operational objective.
         # It does not affect early stopping or canonical checkpoint selection.
-        current_fp97 = fp_metrics["fp_at_97"]
-        if best_fp97 is None or current_fp97 < best_fp97:
-            best_fp97 = current_fp97
+        if best_fp_selection_key is None or fp_selection_key > best_fp_selection_key:
+            best_fp_selection_key = fp_selection_key
             best_fp97_epoch = epoch
 
         # Early stopping
@@ -2028,7 +2179,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
     if best_ap_selection_key is None or best_ap_epoch is None:
         msg = "Training completed without producing an AP diagnostic selection"
         raise RuntimeError(msg)
-    if best_fp97 is None or best_fp97_epoch is None:
+    if best_fp_selection_key is None or best_fp97_epoch is None:
         msg = "Training completed without producing an FP@97 diagnostic selection"
         raise RuntimeError(msg)
     if args.save_ap_best_checkpoint and best_ap_state is None:
@@ -2133,6 +2284,16 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         "teacher_validation_targets": "required for all supervised and distilled cells",
         "member_diagnostics": "full-validation AP/action metrics plus hard-subset diversity",
         "epsilon_policy": EPSILON_POLICY_VERSION,
+        "fixed_recall_detector": {
+            "policy": FP_SELECTION_POLICY,
+            "recall_targets": list(FP_RECALL_TARGETS),
+            "threshold_rule": "highest validation threshold achieving at least the requested recall",
+            "tail_summary": (
+                "exact normalized area of precision under the kth-positive threshold rule "
+                "over requested recall targets [0.95, 0.99]"
+            ),
+            "checkpoint_saved": False,
+        },
     }
     ap_history_row = next(row for row in history if row["epoch"] == best_ap_epoch)
     ap_best_metadata = {
@@ -2154,14 +2315,15 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
     fp97_history_row = next(row for row in history if row["epoch"] == best_fp97_epoch)
     fp97_metadata = {
         "enabled": True,
-        "saved": True,
-        "path": None,  # FP@97 checkpoint is metadata-only, not saved to disk
-        "policy": "fp97-min-diagnostic-v1",
+        "saved": False,
+        "path": None,
+        "policy": FP_SELECTION_POLICY,
         "canonical": False,
-        "uses_hard_actions": False,
-        "criteria": ["minimize false positives at 97% recall"],
+        "uses_hard_actions": True,
+        "thresholds_fitted_on": "validation",
+        "criteria": list(FP_SELECTION_CRITERIA),
         "best_epoch": best_fp97_epoch,
-        "best_key": [int(fp97_history_row["fp_at_97"])],
+        "best_key": list(best_fp_selection_key),
         "validation_fp_at_95": int(fp97_history_row["fp_at_95"]),
         "validation_fp_at_97": int(fp97_history_row["fp_at_97"]),
         "validation_fp_at_99": int(fp97_history_row["fp_at_99"]),
@@ -2169,6 +2331,11 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         "validation_precision_at_97": float(fp97_history_row["precision_at_97"]),
         "validation_precision_at_99": float(fp97_history_row["precision_at_99"]),
         "validation_partial_pr_auc_95_99": float(fp97_history_row["partial_pr_auc_95_99"]),
+        "validation_mean_precision_target_recall_95_99": float(fp97_history_row["mean_precision_target_recall_95_99"]),
+        "tail_summary_definition": (
+            "exact normalized area of precision under the kth-positive threshold rule "
+            "over requested recall targets [0.95, 0.99]"
+        ),
         "same_epoch_as_canonical": best_fp97_epoch == best_epoch,
         "same_epoch_as_ap_best": best_fp97_epoch == best_ap_epoch,
     }
@@ -2296,7 +2463,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--preprocess",
         default="physical",
-        choices=("physical", "quantile", "raw"),
+        choices=PREPROCESS_VARIANTS,
         help="Preprocessing variant",
     )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Output directory")

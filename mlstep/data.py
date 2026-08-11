@@ -14,6 +14,10 @@ SPIN_UP_STEPS = 1  # We ignore the first timestep due to a spin up effect
 TRAIN_FRACTION = 0.7
 VALIDATION_FRACTION = 0.15
 CHUNK_SIZE = 65_536  # rows per block when reducing over the design matrix
+QUANTILE_FIT_SAMPLE_ROWS = 1_000_000
+QUANTILE_FIT_SEED = 0
+MATRIX_NDIM = 2
+MIN_STRETCH_BINS = 2
 GRID_SHAPE = (38, 72, 96)
 
 
@@ -108,12 +112,108 @@ class Preprocesser:
         }
 
 
+def _physical_transform_fit_in_place(x: np.ndarray, features: tuple[Feature, ...]) -> np.ndarray:
+    """Fit the existing physical scales and transform one training matrix."""
+    nonzero = np.zeros(x.shape[1], dtype=np.int64)
+    absolute_sum = np.zeros(x.shape[1], dtype=np.float64)
+    for chunk in chunks(x):
+        nonzero += np.count_nonzero(chunk, axis=0)
+        absolute_sum += np.abs(chunk).sum(axis=0, dtype=np.float64)
+
+    scale = np.where(nonzero > 0, absolute_sum / np.maximum(nonzero, 1), 1.0).astype(np.float32)
+    transform_in_place(x, scale, features)
+    return scale
+
+
+def _deterministic_quantile_sample(
+    x: np.ndarray,
+    *,
+    max_rows: int = QUANTILE_FIT_SAMPLE_ROWS,
+    seed: int = QUANTILE_FIT_SEED,
+) -> np.ndarray:
+    """Return a bounded, reproducible training-row sample for quantile fitting.
+
+    One row is selected from each of ``max_rows`` contiguous strata. The sorted
+    indices preserve mostly sequential access when ``x`` is backed by a memmap,
+    while the fixed random offset within each stratum avoids periodic sampling
+    artefacts in spatially ordered fields.
+    """
+    if x.ndim != MATRIX_NDIM or not len(x):
+        msg = "quantile fitting requires a non-empty two-dimensional matrix"
+        raise ValueError(msg)
+    if isinstance(max_rows, bool) or not isinstance(max_rows, int) or max_rows < 1:
+        msg = "max_rows must be a positive integer"
+        raise ValueError(msg)
+    if len(x) <= max_rows:
+        return np.asarray(x)
+
+    edges = np.floor_divide(
+        np.arange(max_rows + 1, dtype=np.int64) * len(x),
+        max_rows,
+    )
+    widths = np.diff(edges)
+    generator = np.random.default_rng(seed)
+    offsets = np.floor(generator.random(max_rows) * widths).astype(np.int64)
+    indices = edges[:-1] + offsets
+    return np.array(x[indices], dtype=np.float32, order="c", copy=True)
+
+
+def _column_extrema(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Compute exact per-column extrema with bounded working memory."""
+    minimum = np.full(x.shape[1], np.inf, dtype=np.float32)
+    maximum = np.full(x.shape[1], -np.inf, dtype=np.float32)
+    for chunk in chunks(x):
+        np.minimum(minimum, np.min(chunk, axis=0), out=minimum)
+        np.maximum(maximum, np.max(chunk, axis=0), out=maximum)
+    if not np.isfinite(minimum).all() or not np.isfinite(maximum).all():
+        msg = "preprocessing inputs must contain only finite values"
+        raise ValueError(msg)
+    return minimum, maximum
+
+
+def _smooth_clip_in_place(x: np.ndarray, threshold: float) -> None:
+    """Apply RealMLP's smooth clipping ``x / sqrt(1 + (x/t)^2)``."""
+    if not math.isfinite(threshold) or threshold < 0.0:
+        msg = "clip_threshold must be finite and non-negative"
+        raise ValueError(msg)
+    if threshold == 0.0:
+        return
+
+    for chunk in chunks(x):
+        denominator = np.empty_like(chunk)
+        np.divide(chunk, threshold, out=denominator)
+        np.hypot(denominator, 1.0, out=denominator)
+        np.divide(chunk, denominator, out=chunk)
+
+
+def _stretch_column(values: np.ndarray, boundaries: np.ndarray, n_bins: int) -> np.ndarray:
+    """Map one column monotonically through quantile-bin interpolation."""
+    bin_indices = np.searchsorted(boundaries[1:-1], values, side="right")
+    bin_left = boundaries[bin_indices]
+    bin_right = boundaries[bin_indices + 1]
+    bin_width = bin_right - bin_left
+
+    position = np.zeros_like(values, dtype=np.float32)
+    np.subtract(values, bin_left, out=position)
+    np.divide(position, bin_width, out=position, where=bin_width > 0.0)
+    # ``side='right'`` skips interior duplicate knots. Remaining zero-width
+    # intervals come from constant features or repeated endpoints; retain the
+    # expected lower/upper tail ordering for values outside the training range.
+    zero_width = bin_width <= 0.0
+    position[zero_width] = values[zero_width] >= bin_right[zero_width]
+    np.clip(position, 0.0, 1.0, out=position)
+    np.add(position, bin_indices, out=position, casting="unsafe")
+    position /= n_bins
+    return position
+
+
 @dataclass
 class RobustPreprocesser:
     """Convert atmospheric variables using median/IQR robust scaling with smooth clipping.
 
     This preprocessing is less sensitive to extreme outliers than mean/std scaling.
-    Uses the RealMLP approach: median centering, IQR scaling, and smooth tanh clipping.
+    It follows RealMLP: median centering, IQR scaling with a range fallback,
+    and smooth clipping to a bounded interval.
     """
 
     scale: np.ndarray
@@ -121,6 +221,7 @@ class RobustPreprocesser:
     iqr: np.ndarray
     clip_threshold: float
     features: tuple[Feature, ...]
+    fit_sample_rows: int
 
     @classmethod
     def fit_transform(
@@ -128,43 +229,35 @@ class RobustPreprocesser:
     ) -> tuple["RobustPreprocesser", np.ndarray]:
         """Apply transformations and calculate robust statistics."""
         x = np.asarray(x, dtype=np.float32, order="c")
-        nonzero = np.zeros(x.shape[1], dtype=np.int64)
-        absolute_sum = np.zeros(x.shape[1])
+        scale = _physical_transform_fit_in_place(x, features)
 
-        for chunk in chunks(x):
-            nonzero += np.count_nonzero(chunk, axis=0)
-            absolute_sum += np.abs(chunk).sum(axis=0, dtype=np.float64)
-
-        scale = np.where(nonzero > 0, absolute_sum / np.maximum(nonzero, 1), 1.0).astype(np.float32)
-        transform_in_place(x, scale, features)
-
-        # Compute median (50th percentile)
-        median = np.zeros(x.shape[1], dtype=np.float64)
-        for chunk in chunks(x):
-            median += np.median(chunk, axis=0)
-        median = (median / (len(x) / CHUNK_SIZE)).astype(np.float32)
-
-        # Compute IQR (75th - 25th percentile)
-        q75 = np.zeros(x.shape[1], dtype=np.float64)
-        q25 = np.zeros(x.shape[1], dtype=np.float64)
-        for chunk in chunks(x):
-            q75 += np.percentile(chunk, 75, axis=0)
-            q25 += np.percentile(chunk, 25, axis=0)
-        q75 = (q75 / (len(x) / CHUNK_SIZE)).astype(np.float32)
-        q25 = (q25 / (len(x) / CHUNK_SIZE)).astype(np.float32)
+        minimum, maximum = _column_extrema(x)
+        fit_sample = _deterministic_quantile_sample(x)
+        fit_sample_rows = len(fit_sample)
+        quartiles = np.percentile(
+            fit_sample,
+            (25.0, 50.0, 75.0),
+            axis=0,
+            method="linear",
+        ).astype(np.float32)
+        del fit_sample
+        q25, median, q75 = quartiles
         iqr = q75 - q25
-        iqr[iqr == 0] = 1.0
+
+        # RealMLP falls back to scaling a non-constant zero-IQR column into a
+        # width-two interval. Constant columns remain zero after centering.
+        zero_iqr = iqr == 0.0
+        data_range = maximum - minimum
+        iqr[zero_iqr & (data_range > 0.0)] = data_range[zero_iqr & (data_range > 0.0)] / 2.0
+        iqr[iqr == 0.0] = 1.0
 
         # Robust scaling: subtract median, divide by IQR
         x -= median
         x /= iqr
 
-        # Smooth clipping using tanh
-        if clip_threshold > 0:
-            np.tanh(np.clip(x, -clip_threshold, clip_threshold) / clip_threshold, out=x)
-            x *= clip_threshold
+        _smooth_clip_in_place(x, clip_threshold)
 
-        return cls(scale, median, iqr, clip_threshold, features), x
+        return cls(scale, median, iqr, clip_threshold, features, fit_sample_rows), x
 
     def transform(self, x: np.ndarray, *, copy: bool = True) -> np.ndarray:
         """Transform new data using learned robust statistics."""
@@ -172,9 +265,7 @@ class RobustPreprocesser:
         transform_in_place(out, self.scale, self.features)
         out -= self.median
         out /= self.iqr
-        if self.clip_threshold > 0:
-            np.tanh(np.clip(out, -self.clip_threshold, self.clip_threshold) / self.clip_threshold, out=out)
-            out *= self.clip_threshold
+        _smooth_clip_in_place(out, self.clip_threshold)
         return out
 
     def state(self) -> dict[str, np.ndarray]:
@@ -184,6 +275,10 @@ class RobustPreprocesser:
             "median": self.median,
             "iqr": self.iqr,
             "clip_threshold": np.array([self.clip_threshold]),
+            "fit_sample_rows": np.array([self.fit_sample_rows]),
+            "fit_sample_max_rows": np.array([QUANTILE_FIT_SAMPLE_ROWS]),
+            "fit_sample_seed": np.array([QUANTILE_FIT_SEED]),
+            "quantile_method": np.array("linear"),
         }
 
 
@@ -199,59 +294,53 @@ class StretchPreprocesser:
     quantiles: np.ndarray  # Shape: (n_bins + 1, n_features)
     n_bins: int
     features: tuple[Feature, ...]
+    mean: np.ndarray
+    std: np.ndarray
+    fit_sample_rows: int
 
     @classmethod
     def fit_transform(cls, x: np.ndarray, features, n_bins: int = 128) -> tuple["StretchPreprocesser", np.ndarray]:
-        """Apply transformations and fit quantile bins."""
+        """Fit train-only quantile bins, stretch, and standardize each column."""
+        if isinstance(n_bins, bool) or not isinstance(n_bins, int) or n_bins < MIN_STRETCH_BINS:
+            msg = "n_bins must be an integer of at least two"
+            raise ValueError(msg)
         x = np.asarray(x, dtype=np.float32, order="c")
-        nonzero = np.zeros(x.shape[1], dtype=np.int64)
-        absolute_sum = np.zeros(x.shape[1])
+        scale = _physical_transform_fit_in_place(x, features)
 
-        for chunk in chunks(x):
-            nonzero += np.count_nonzero(chunk, axis=0)
-            absolute_sum += np.abs(chunk).sum(axis=0, dtype=np.float64)
-
-        scale = np.where(nonzero > 0, absolute_sum / np.maximum(nonzero, 1), 1.0).astype(np.float32)
-        transform_in_place(x, scale, features)
-
-        # Compute quantiles for each feature
-        quantile_probs = np.linspace(0, 1, n_bins + 1)
-        quantiles = np.zeros((n_bins + 1, x.shape[1]), dtype=np.float32)
-
-        for i, q in enumerate(quantile_probs):
-            q_values = np.zeros(x.shape[1], dtype=np.float64)
-            for chunk in chunks(x):
-                q_values += np.percentile(chunk, q * 100, axis=0)
-            quantiles[i] = (q_values / (len(x) / CHUNK_SIZE)).astype(np.float32)
+        minimum, maximum = _column_extrema(x)
+        fit_sample = _deterministic_quantile_sample(x)
+        fit_sample_rows = len(fit_sample)
+        quantile_probs = np.linspace(0.0, 100.0, n_bins + 1)
+        quantiles = np.percentile(
+            fit_sample,
+            quantile_probs,
+            axis=0,
+            method="linear",
+        ).astype(np.float32)
+        del fit_sample
+        # Preserve the complete observed training range even when the interior
+        # quantiles are estimated from the bounded row sample.
+        quantiles[0] = minimum
+        quantiles[-1] = maximum
+        np.maximum.accumulate(quantiles, axis=0, out=quantiles)
 
         # Apply stretch transformation
         stretched = np.empty_like(x)
         n_features = x.shape[1]
+        mean = np.empty(n_features, dtype=np.float32)
+        std = np.empty(n_features, dtype=np.float32)
 
         for feat_idx in range(n_features):
-            col = x[:, feat_idx]
-            feat_quantiles = quantiles[:, feat_idx]
+            stretched_pos = _stretch_column(x[:, feat_idx], quantiles[:, feat_idx], n_bins)
+            mean[feat_idx] = np.mean(stretched_pos, dtype=np.float64)
+            std[feat_idx] = np.std(stretched_pos, dtype=np.float64)
+            if std[feat_idx] == 0.0:
+                std[feat_idx] = 1.0
+            stretched_pos -= mean[feat_idx]
+            stretched_pos /= std[feat_idx]
+            stretched[:, feat_idx] = stretched_pos
 
-            # For each value, find its bin and apply stretch
-            # Digitize returns 1-based bin indices
-            bin_indices = np.digitize(col, feat_quantiles[1:-1], right=False)
-            bin_indices = np.clip(bin_indices - 1, 0, n_bins - 1)
-
-            # Linear interpolation within bin
-            bin_left = feat_quantiles[bin_indices]
-            bin_right = feat_quantiles[bin_indices + 1]
-            bin_width = bin_right - bin_left
-            bin_width[bin_width == 0] = 1.0  # Avoid division by zero
-
-            # Normalized position within bin [0, 1]
-            position = (col - bin_left) / bin_width
-            position = np.clip(position, 0, 1)
-
-            # Apply CDF-like stretch
-            stretched_pos = (bin_indices + position) / n_bins
-            stretched[:, feat_idx] = stretched_pos.astype(np.float32)
-
-        return cls(scale, quantiles, n_bins, features), stretched
+        return cls(scale, quantiles, n_bins, features, mean, std, fit_sample_rows), stretched
 
     def transform(self, x: np.ndarray, *, copy: bool = True) -> np.ndarray:
         """Transform new data using learned quantiles."""
@@ -262,22 +351,10 @@ class StretchPreprocesser:
         n_features = out.shape[1]
 
         for feat_idx in range(n_features):
-            col = out[:, feat_idx]
-            feat_quantiles = self.quantiles[:, feat_idx]
-
-            bin_indices = np.digitize(col, feat_quantiles[1:-1], right=False)
-            bin_indices = np.clip(bin_indices - 1, 0, self.n_bins - 1)
-
-            bin_left = feat_quantiles[bin_indices]
-            bin_right = feat_quantiles[bin_indices + 1]
-            bin_width = bin_right - bin_left
-            bin_width[bin_width == 0] = 1.0
-
-            position = (col - bin_left) / bin_width
-            position = np.clip(position, 0, 1)
-
-            stretched_pos = (bin_indices + position) / self.n_bins
-            stretched[:, feat_idx] = stretched_pos.astype(np.float32)
+            stretched_pos = _stretch_column(out[:, feat_idx], self.quantiles[:, feat_idx], self.n_bins)
+            stretched_pos -= self.mean[feat_idx]
+            stretched_pos /= self.std[feat_idx]
+            stretched[:, feat_idx] = stretched_pos
 
         return stretched
 
@@ -287,6 +364,12 @@ class StretchPreprocesser:
             "scale": self.scale,
             "quantiles": self.quantiles,
             "n_bins": np.array([self.n_bins]),
+            "mean": self.mean,
+            "std": self.std,
+            "fit_sample_rows": np.array([self.fit_sample_rows]),
+            "fit_sample_max_rows": np.array([QUANTILE_FIT_SAMPLE_ROWS]),
+            "fit_sample_seed": np.array([QUANTILE_FIT_SEED]),
+            "quantile_method": np.array("linear"),
         }
 
 
@@ -413,13 +496,26 @@ def load_labels(data_dir: Path, timesteps: tuple[int, ...]) -> tuple[np.ndarray,
 
 
 def _selected_row_layout(
-    _,
+    timesteps: tuple[int, ...],
     selected_indices: np.ndarray,
     rows_per_timestep: tuple[int, ...],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Group selected rows by their source timestep."""
     row_counts = np.asarray(rows_per_timestep)
     indices = np.asarray(selected_indices)
+    if row_counts.ndim != 1 or len(row_counts) != len(timesteps) or np.any(row_counts < 0):
+        msg = "rows_per_timestep must contain one non-negative count per timestep"
+        raise ValueError(msg)
+    if indices.ndim != 1 or not np.issubdtype(indices.dtype, np.integer):
+        msg = "selected_indices must be a one-dimensional integer array"
+        raise ValueError(msg)
+    if len(np.unique(indices)) != len(indices):
+        msg = "selected_indices must not contain duplicates"
+        raise ValueError(msg)
+    total_rows = int(row_counts.sum())
+    if np.any(indices < 0) or np.any(indices >= total_rows):
+        msg = f"selected_indices must be in range [0, {total_rows})"
+        raise IndexError(msg)
     # Sorting groups disk reads by timestep. destination_rows maps each sorted
     # source row back to its original, possibly shuffled output position.
     destination_rows = np.argsort(indices, kind="stable")

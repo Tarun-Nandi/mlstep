@@ -1,8 +1,4 @@
-"""Piecewise-linear numerical embeddings for tabular models.
-
-Based on the numerical embeddings paper and TabM documentation.
-Provides PLE (Piecewise Linear Embedding) for continuous features.
-"""
+"""Piecewise-linear numerical embeddings for tabular models."""
 
 import math
 
@@ -12,22 +8,40 @@ from torch import nn
 MATRIX_NDIM = 2
 
 
+def _positive_integer(value: int, name: str) -> None:
+    """Reject booleans and non-positive integer settings."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        msg = f"{name} must be a positive integer"
+        raise ValueError(msg)
+
+
 class PiecewiseLinearEmbedding(nn.Module):
-    """Apply piecewise-linear embeddings to continuous features.
+    """Encode continuous features with cumulative piecewise-linear bases.
 
-    Each feature is divided into quantile bins and assigned a learnable
-    embedding vector. The embedding is selected based on which bin the
-    feature value falls into, with linear interpolation between bins.
+    For feature ``f`` with non-decreasing boundaries
+    ``b[f, 0], ..., b[f, n_bins]``, interval ``j`` contributes
 
-    Args:
-        n_features: Number of continuous features to embed
-        n_bins: Number of quantile bins per feature (default: 48)
-        embedding_dim: Dimension of each embedding vector (default: 12)
-        version: Embedding version ('A' with activation, 'B' without)
+    ``clip((x - b[f, j]) / (b[f, j + 1] - b[f, j]), 0, 1)``.
 
-    Reference:
-        "Numerical Embeddings: A collection of techniques for embedding
-        continuous features in neural networks"
+    These contributions form the usual cumulative piecewise-linear encoding:
+    intervals below the value are one, the active interval is fractional, and
+    intervals above the value are zero. Each feature has an independent learned
+    linear projection from this encoding to ``embedding_dim`` outputs.
+
+    Repeated quantile boundaries are permitted. A zero-width interval is
+    defined as the step ``x >= boundary``, which keeps the encoding finite and
+    deterministic for sparse or constant features.
+
+    Parameters
+    ----------
+    n_features:
+        Number of continuous input features.
+    n_bins:
+        Number of intervals, and therefore encoding components, per feature.
+    embedding_dim:
+        Output width of each feature-specific projection.
+    version:
+        ``"B"`` returns the linear projection. ``"A"`` applies ReLU to it.
     """
 
     def __init__(
@@ -38,16 +52,9 @@ class PiecewiseLinearEmbedding(nn.Module):
         version: str = "B",
     ) -> None:
         super().__init__()
-
-        if n_features <= 0:
-            msg = "n_features must be positive"
-            raise ValueError(msg)
-        if n_bins <= 1:
-            msg = "n_bins must be at least 2"
-            raise ValueError(msg)
-        if embedding_dim <= 0:
-            msg = "embedding_dim must be positive"
-            raise ValueError(msg)
+        _positive_integer(n_features, "n_features")
+        _positive_integer(n_bins, "n_bins")
+        _positive_integer(embedding_dim, "embedding_dim")
         if version not in ("A", "B"):
             msg = "version must be 'A' or 'B'"
             raise ValueError(msg)
@@ -57,102 +64,109 @@ class PiecewiseLinearEmbedding(nn.Module):
         self.embedding_dim = embedding_dim
         self.version = version
 
-        # Learnable embedding vectors for each bin of each feature
-        # Shape: (n_features, n_bins, embedding_dim)
+        # This is a batched collection of feature-specific Linear layers. The
+        # historical ``embeddings`` name is retained for the public/state API.
         self.embeddings = nn.Parameter(torch.empty(n_features, n_bins, embedding_dim))
+        self.bias = nn.Parameter(torch.empty(n_features, embedding_dim))
 
-        # Bin boundaries (quantiles) - learned from data during preprocessing
-        # These are stored as buffers but fitted externally and loaded
-        self.register_buffer("bin_boundaries", torch.zeros(n_features, n_bins + 1))
-
+        self.register_buffer("bin_boundaries", torch.empty(n_features, n_bins + 1))
+        self._boundaries_fitted = False
         self.reset_parameters()
 
+    @property
+    def output_dim(self) -> int:
+        """Return the flattened output width."""
+        return self.n_features * self.embedding_dim
+
     def reset_parameters(self) -> None:
-        """Initialize embeddings using Kaiming uniform."""
-        nn.init.kaiming_uniform_(self.embeddings, a=math.sqrt(5))
+        """Initialize each feature projection like ``nn.Linear``."""
+        bound = 1.0 / math.sqrt(self.n_bins)
+        nn.init.uniform_(self.embeddings, -bound, bound)
+        nn.init.uniform_(self.bias, -bound, bound)
 
     def set_bin_boundaries(self, boundaries: torch.Tensor) -> None:
-        """Set quantile bin boundaries from preprocessing.
+        """Validate and store fitted boundaries.
 
-        Args:
-            boundaries: Tensor of shape (n_features, n_bins + 1) containing
-                        the bin edges for each feature.
+        Parameters
+        ----------
+        boundaries:
+            Finite, non-decreasing tensor with shape
+            ``(n_features, n_bins + 1)``. Duplicate values are allowed.
         """
-        if boundaries.shape != (self.n_features, self.n_bins + 1):
-            msg = f"Expected boundaries shape ({self.n_features}, {self.n_bins + 1}), got {boundaries.shape}"
+        if not isinstance(boundaries, torch.Tensor):
+            msg = "boundaries must be a torch tensor"
+            raise TypeError(msg)
+        expected_shape = (self.n_features, self.n_bins + 1)
+        if tuple(boundaries.shape) != expected_shape:
+            msg = f"Expected boundaries shape {expected_shape}, got {tuple(boundaries.shape)}"
             raise ValueError(msg)
-        self.bin_boundaries = boundaries
+        if not torch.isfinite(boundaries).all():
+            msg = "boundaries must be finite"
+            raise ValueError(msg)
+        if torch.any(boundaries[:, 1:] < boundaries[:, :-1]):
+            msg = "boundaries must be non-decreasing for every feature"
+            raise ValueError(msg)
+
+        with torch.no_grad():
+            self.bin_boundaries.copy_(
+                boundaries.detach().to(
+                    device=self.bin_boundaries.device,
+                    dtype=self.bin_boundaries.dtype,
+                )
+            )
+            self._boundaries_fitted = True
+
+    def _load_from_state_dict(
+        self,
+        state_dict: dict[str, torch.Tensor],
+        prefix: str,
+        local_metadata: dict,
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        """Restore the fitted flag when boundaries arrive through a parent module."""
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        if f"{prefix}bin_boundaries" in state_dict:
+            self._boundaries_fitted = True
+
+    def _encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Return cumulative piecewise-linear coordinates."""
+        left = self.bin_boundaries[:, :-1]
+        right = self.bin_boundaries[:, 1:]
+        width = right - left
+        positive_width = width > 0
+        safe_width = torch.where(positive_width, width, torch.ones_like(width))
+
+        values = x.unsqueeze(-1)
+        linear = ((values - left.unsqueeze(0)) / safe_width.unsqueeze(0)).clamp(0.0, 1.0)
+        collapsed = (values >= right.unsqueeze(0)).to(dtype=linear.dtype)
+        return torch.where(positive_width.unsqueeze(0), linear, collapsed)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply piecewise-linear embedding to input features.
-
-        Args:
-            x: Input tensor of shape (batch_size, n_features)
-
-        Returns
-        -------
-            Embedded tensor of shape (batch_size, n_features * embedding_dim).
-
-        Note:
-            This uses linear interpolation between bins. For each feature,
-            we find which bin the value falls into and interpolate between
-            the embeddings of the bounding bin edges.
-        """
+        """Embed a matrix with shape ``(batch, n_features)``."""
         if x.ndim != MATRIX_NDIM or x.shape[1] != self.n_features:
-            msg = f"Expected input shape (batch, {self.n_features}), got {x.shape}"
+            msg = f"Expected input shape (batch, {self.n_features}), got {tuple(x.shape)}"
             raise ValueError(msg)
+        if not x.is_floating_point():
+            msg = "PiecewiseLinearEmbedding requires floating-point inputs"
+            raise TypeError(msg)
+        if not self._boundaries_fitted:
+            msg = "bin boundaries must be fitted before calling forward"
+            raise RuntimeError(msg)
 
-        batch_size = x.shape[0]
-        device = x.device
-
-        # Expand input for vectorized operations
-        # x_expanded: (batch, n_features, 1)
-        x_expanded = x.unsqueeze(-1)
-
-        # boundaries: (n_features, n_bins + 1) -> (1, n_features, n_bins + 1, 1)
-        boundaries = self.bin_boundaries.unsqueeze(0).to(device)
-
-        # Find which bin each value belongs to
-        # bin_indices: (batch, n_features)
-        bin_indices = torch.searchsorted(boundaries.squeeze(-1), x_expanded.squeeze(-1), right=False)
-        bin_indices = torch.clamp(bin_indices, 0, self.n_bins - 1)
-
-        # Get embeddings for the left and right bins
-        # embeddings: (n_features, n_bins, embedding_dim)
-        all_embeddings = self.embeddings.to(device)
-
-        # Gather the embeddings for the bin indices
-        # left_embeddings: (batch, n_features, embedding_dim)
-        left_embeddings = all_embeddings.unsqueeze(0).expand(batch_size, -1, -1, -1)
-        left_embeddings = torch.gather(
-            left_embeddings, 2, bin_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, self.embedding_dim)
-        ).squeeze(2)
-
-        # Get right bin embeddings (with clamping)
-        right_bin_indices = torch.clamp(bin_indices + 1, 0, self.n_bins - 1)
-        right_embeddings = torch.gather(
-            left_embeddings, 2, right_bin_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, -1, self.embedding_dim)
-        ).squeeze(2)
-
-        # Get bin edges for interpolation
-        # left_edges: (batch, n_features)
-        left_edges = torch.gather(boundaries.squeeze(-1), 2, bin_indices.unsqueeze(-1)).squeeze(-1)
-        right_edges = torch.gather(boundaries.squeeze(-1), 2, right_bin_indices.unsqueeze(-1)).squeeze(-1)
-
-        # Compute interpolation weight
-        bin_width = right_edges - left_edges
-        bin_width = torch.clamp(bin_width, min=1e-6)  # Avoid division by zero
-
-        weight = (x - left_edges) / bin_width
-        weight = weight.unsqueeze(-1)  # (batch, n_features, 1)
-
-        # Linear interpolation between left and right embeddings
-        interpolated = left_embeddings + weight * (right_embeddings - left_embeddings)
-
-        # Flatten to (batch, n_features * embedding_dim)
-        output = interpolated.reshape(batch_size, self.n_features * self.embedding_dim)
-
+        encoded = self._encode(x)
+        projected = torch.einsum("bfn,fnd->bfd", encoded, self.embeddings)
+        projected = projected + self.bias.unsqueeze(0)
         if self.version == "A":
-            output = torch.relu(output)
-
-        return output
+            projected = torch.relu(projected)
+        return projected.reshape(x.shape[0], self.output_dim)

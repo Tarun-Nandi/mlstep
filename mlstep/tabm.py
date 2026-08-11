@@ -27,10 +27,31 @@ def _positive_integer(value: int, name: str) -> None:
 class MiniEnsembleInputScaling(nn.Module):
     """Apply a trainable, member-specific scaling before feature mixing."""
 
-    def __init__(self, k: int, n_features: int) -> None:
+    def __init__(
+        self,
+        k: int,
+        n_features: int,
+        *,
+        initialization: str = "random-signs",
+        feature_sizes: list[int] | tuple[int, ...] | None = None,
+    ) -> None:
         super().__init__()
         _positive_integer(k, "k")
         _positive_integer(n_features, "n_features")
+        if initialization not in ("random-signs", "normal"):
+            msg = "initialization must be 'random-signs' or 'normal'"
+            raise ValueError(msg)
+        if feature_sizes is None:
+            normalized_feature_sizes = tuple(1 for _ in range(n_features))
+        else:
+            normalized_feature_sizes = tuple(feature_sizes)
+            for size in normalized_feature_sizes:
+                _positive_integer(size, "feature size")
+            if sum(normalized_feature_sizes) != n_features:
+                msg = "feature_sizes must sum to n_features"
+                raise ValueError(msg)
+        self.initialization = initialization
+        self.feature_sizes = normalized_feature_sizes
         self.weight = nn.Parameter(torch.empty(k, n_features))
         self.reset_parameters()
 
@@ -45,9 +66,24 @@ class MiniEnsembleInputScaling(nn.Module):
         return self.weight.shape[1]
 
     def reset_parameters(self) -> None:
-        """Initialize every member-feature scaling independently to -1 or 1."""
+        """Initialize member scaling, optionally sharing values within feature chunks."""
         with torch.no_grad():
-            self.weight.bernoulli_(0.5).mul_(2.0).add_(-1.0)
+            if self.initialization == "random-signs":
+                self.weight.bernoulli_(0.5).mul_(2.0).add_(-1.0)
+            else:
+                chunk_values = torch.empty(
+                    self.k,
+                    len(self.feature_sizes),
+                    device=self.weight.device,
+                    dtype=self.weight.dtype,
+                )
+                nn.init.normal_(chunk_values)
+                expanded = torch.repeat_interleave(
+                    chunk_values,
+                    torch.tensor(self.feature_sizes, device=self.weight.device),
+                    dim=1,
+                )
+                self.weight.copy_(expanded)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Scale an ensemble tensor with shape ``(batch, members, features)``."""
