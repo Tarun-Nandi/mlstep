@@ -65,7 +65,7 @@ def boundary_probabilities(probabilities: np.ndarray, max_action: int) -> np.nda
     for label in range(probabilities.shape[1] - 1, -1, -1):
         tail += probabilities[:, label]
         if label <= max_action:
-            boundaries[:, label] = tail
+            boundaries /= tail[:, None]
     boundaries /= probabilities.sum(axis=1, dtype=np.float64, keepdims=True)
     # Action zero cannot overpredict by definition, so its lower-boundary
     # probability is exactly one rather than an approximately normalized sum.
