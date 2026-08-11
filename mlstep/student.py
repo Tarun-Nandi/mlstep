@@ -111,6 +111,10 @@ WEEK_MAX_ACTION: Final = 3
 POLICY_DIAGNOSTIC_CONFIDENCES: Final = (1.0, 0.999, 0.995, 0.99, 0.975, 0.95, 0.9, 0.8, 0.7, 0.5)
 POLICY_DIAGNOSTIC_RECALLS: Final = (0.80, 0.90, 0.95, 0.97, 0.99, 1.0)
 
+# FP@97-aligned diagnostics. These track the operational objective directly.
+FP_RECALL_TARGETS: Final = (0.95, 0.97, 0.99)
+FP_DIAGNOSTIC_ENABLED: Final = True
+
 FeatureMatrix = np.ndarray | torch.Tensor
 
 
@@ -1230,6 +1234,69 @@ def evaluate_model(
     )
 
 
+def fp_recall_diagnostics(
+    detector_probability: np.ndarray,
+    labels: np.ndarray,
+    recall_targets: tuple[float, ...] = FP_RECALL_TARGETS,
+) -> dict:
+    """Compute FP count and precision at multiple recall levels.
+
+    Returns a dict with keys like 'fp_at_95', 'precision_at_95', etc.
+    Also computes partial PR-AUC over the 95-99% recall region.
+    """
+    detector_probability = np.asarray(detector_probability)
+    labels = np.asarray(labels)
+    positive = labels > 0
+    positive_scores = detector_probability[positive]
+
+    if not len(positive_scores):
+        return {f"fp_at_{int(r * 100)}": -1 for r in recall_targets}
+
+    # Sort positive scores in descending order for threshold calculation
+    positive_scores_sorted = np.sort(positive_scores)[::-1]
+
+    result = {}
+
+    # Compute FP and precision at each recall target
+    for recall in recall_targets:
+        required = int(np.ceil(recall * len(positive_scores)))
+        threshold = float(positive_scores_sorted[required - 1])
+
+        detected = detector_probability >= threshold
+        true_positive = int((detected & positive).sum())
+        false_positive = int((detected & ~positive).sum())
+
+        result[f"fp_at_{int(recall * 100)}"] = false_positive
+        result[f"precision_at_{int(recall * 100)}"] = (
+            true_positive / (true_positive + false_positive) if (true_positive + false_positive) > 0 else 0.0
+        )
+
+    # Compute partial PR-AUC over 95-99% recall region
+    # Use dense recall points for stability
+    n_recall_points = 50
+    recall_grid = np.linspace(0.95, 0.99, n_recall_points)
+
+    # Get precision at each recall point
+    precisions = []
+    for recall in recall_grid:
+        required = int(np.ceil(recall * len(positive_scores)))
+        required = min(required, len(positive_scores))
+        threshold = float(positive_scores_sorted[required - 1])
+
+        detected = detector_probability >= threshold
+        true_positive = int((detected & positive).sum())
+        false_positive = int((detected & ~positive).sum())
+
+        precision = true_positive / (true_positive + false_positive) if (true_positive + false_positive) > 0 else 0.0
+        precisions.append(precision)
+
+    # Approximate area using trapezoidal rule
+    partial_pr_auc = float(np.trapezoid(precisions, recall_grid) / (0.99 - 0.95))
+    result["partial_pr_auc_95_99"] = partial_pr_auc
+
+    return result
+
+
 def epsilon_policy_diagnostic(
     probabilities: np.ndarray,
     labels: np.ndarray,
@@ -1635,6 +1702,8 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
     best_ap_selection_key = None
     best_ap_epoch = None
     best_ap_state = None
+    best_fp97 = None
+    best_fp97_epoch = None
     history = []
 
     print(f"\nTraining for {args.epochs} epochs with patience {args.patience}")
@@ -1704,6 +1773,9 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         val_nll = float(probability["negative_log_likelihood"])
         val_brier = float(probability["brier_score"])
 
+        # Compute FP@97-aligned diagnostics
+        fp_metrics = fp_recall_diagnostics(val_detector_probability, val_y)
+
         if not all(
             np.isfinite(value)
             for value in (
@@ -1746,12 +1818,18 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
                 "validation_metrics_seconds": metrics_seconds,
                 "gpu_peak_allocated_mib": gpu_peak_allocated_mib,
                 "gpu_peak_reserved_mib": gpu_peak_reserved_mib,
+                **{f"fp_at_{int(r * 100)}": fp_metrics[f"fp_at_{int(r * 100)}"] for r in FP_RECALL_TARGETS},
+                **{
+                    f"precision_at_{int(r * 100)}": fp_metrics[f"precision_at_{int(r * 100)}"]
+                    for r in FP_RECALL_TARGETS
+                },
+                "partial_pr_auc_95_99": fp_metrics["partial_pr_auc_95_99"],
             }
         )
 
         print(
             f"Epoch {epoch:3d} | loss {train_loss:.4f} | "
-            f"RPS {val_rps:.6g} | NLL {val_nll:.6g} | AP {val_ap:.4f} | "
+            f"RPS {val_rps:.6g} | NLL {val_nll:.6g} | AP {val_ap:.4f} | FP@97 {fp_metrics['fp_at_97']:4d} | "
             f"time {epoch_time:.1f}s "
             f"(stage {train_result.staging_seconds:.1f}s, "
             f"train {train_result.optimization_seconds:.1f}s, "
@@ -1766,6 +1844,10 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
             f"KD detector {loss_parts['kd_detector']:.5f} | "
             f"KD severity {loss_parts['kd_severity']:.5f}"
         )
+        print(
+            f"  FP diagnostics | FP@95 {fp_metrics['fp_at_95']:4d} | FP@97 {fp_metrics['fp_at_97']:4d} | "
+            f"FP@99 {fp_metrics['fp_at_99']:4d} | Partial PR-AUC {fp_metrics['partial_pr_auc_95_99']:.4f}"
+        )
 
         # AP is tracked independently for an opt-in ranking diagnostic. It
         # does not affect canonical early stopping or any final metrics.
@@ -1774,6 +1856,13 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
             best_ap_epoch = epoch
             if args.save_ap_best_checkpoint:
                 best_ap_state = {name: value.cpu().clone() for name, value in model.state_dict().items()}
+
+        # FP@97 is tracked as a diagnostic for the operational objective.
+        # It does not affect early stopping or canonical checkpoint selection.
+        current_fp97 = fp_metrics["fp_at_97"]
+        if best_fp97 is None or current_fp97 < best_fp97:
+            best_fp97 = current_fp97
+            best_fp97_epoch = epoch
 
         # Early stopping
         if best_selection_key is None or selection_key > best_selection_key:
@@ -1801,6 +1890,9 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         raise RuntimeError(msg)
     if best_ap_selection_key is None or best_ap_epoch is None:
         msg = "Training completed without producing an AP diagnostic selection"
+        raise RuntimeError(msg)
+    if best_fp97 is None or best_fp97_epoch is None:
+        msg = "Training completed without producing an FP@97 diagnostic selection"
         raise RuntimeError(msg)
     if args.save_ap_best_checkpoint and best_ap_state is None:
         msg = "AP-best checkpoint saving was enabled but no state was captured"
@@ -1921,7 +2013,29 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         "validation_negative_log_likelihood": float(ap_history_row["validation_negative_log_likelihood"]),
         "same_epoch_as_canonical": best_ap_epoch == best_epoch,
     }
-    diagnostic_checkpoints = {"ap_best": ap_best_metadata}
+
+    fp97_history_row = next(row for row in history if row["epoch"] == best_fp97_epoch)
+    fp97_metadata = {
+        "enabled": True,
+        "saved": True,
+        "path": None,  # FP@97 checkpoint is metadata-only, not saved to disk
+        "policy": "fp97-min-diagnostic-v1",
+        "canonical": False,
+        "uses_hard_actions": False,
+        "criteria": ["minimize false positives at 97% recall"],
+        "best_epoch": best_fp97_epoch,
+        "best_key": [int(fp97_history_row["fp_at_97"])],
+        "validation_fp_at_95": int(fp97_history_row["fp_at_95"]),
+        "validation_fp_at_97": int(fp97_history_row["fp_at_97"]),
+        "validation_fp_at_99": int(fp97_history_row["fp_at_99"]),
+        "validation_precision_at_95": float(fp97_history_row["precision_at_95"]),
+        "validation_precision_at_97": float(fp97_history_row["precision_at_97"]),
+        "validation_precision_at_99": float(fp97_history_row["precision_at_99"]),
+        "validation_partial_pr_auc_95_99": float(fp97_history_row["partial_pr_auc_95_99"]),
+        "same_epoch_as_canonical": best_fp97_epoch == best_epoch,
+        "same_epoch_as_ap_best": best_fp97_epoch == best_ap_epoch,
+    }
+    diagnostic_checkpoints = {"ap_best": ap_best_metadata, "fp97_best": fp97_metadata}
 
     torch.save(
         {
