@@ -13,6 +13,7 @@ import csv
 import hashlib
 import importlib
 import json
+import math
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ from typing import Final
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from mlstep.data import FEATURES, GRID_SHAPE, N_CLASSES, Feature, class_counts, feature_names
 from mlstep.evaluation import detection_ap, detection_counts, probability_metrics, safe_divide, threshold_at_recall
@@ -122,6 +124,14 @@ class ExpectedGradientResult:
     explained_outputs: np.ndarray
     sampled_reference_outputs: np.ndarray
     fixed_background_output: np.ndarray
+
+
+@dataclass(frozen=True, slots=True)
+class EnsemblePredictionResult:
+    """Joint predictions plus a numerically stable conditional severity view."""
+
+    joint_probabilities: np.ndarray
+    conditional_severity: np.ndarray
 
 
 class PermutedFeatureMatrix:
@@ -506,6 +516,58 @@ def _synchronize(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+def _ensemble_joint_and_conditional(
+    models: Sequence[Student],
+    inputs: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the deployed joint mixture and stable conditional severity.
+
+    The joint distribution deliberately follows ``Student.forward`` in the
+    model dtype.  Conditional severity is additionally reconstructed from raw
+    member logits in float64 log space.  This represents the same
+    detector-weighted equal-joint mixture, but it remains defined when an
+    extremely negative detector logit makes float32 sigmoid underflow to zero.
+    """
+    if not models:
+        msg = "At least one model is required"
+        raise ValueError(msg)
+
+    joint_sum = None
+    log_positive_sum = None
+    for model in models:
+        detector_logits, severity_logits = model.forward_logits(inputs)
+
+        # Reproduce Student.forward and joint_distribution in the deployed
+        # model dtype so headline joint/detector metrics do not change.
+        member_detector = torch.sigmoid(detector_logits)
+        member_severity = torch.softmax(severity_logits, dim=-1)
+        detector = member_detector.mean(dim=0)
+        positive_mass = (member_detector.unsqueeze(-1) * member_severity).mean(dim=0)
+        conditional = positive_mass / detector.unsqueeze(-1).clamp_min(torch.finfo(detector.dtype).tiny)
+        joint = model.joint_distribution(detector, conditional)
+        joint_sum = joint if joint_sum is None else joint_sum + joint
+
+        # Each checkpoint has equal weight, and each of its K members has
+        # equal weight.  Constants common to every severity class cancel in
+        # the final softmax, but retaining 1/K makes the checkpoint semantics
+        # explicit and remains correct if models with different K are used.
+        member_log_positive = F.logsigmoid(detector_logits.to(torch.float64)).unsqueeze(-1)
+        member_log_positive = member_log_positive + F.log_softmax(severity_logits.to(torch.float64), dim=-1)
+        checkpoint_log_positive = torch.logsumexp(member_log_positive, dim=0) - math.log(detector_logits.shape[0])
+        log_positive_sum = (
+            checkpoint_log_positive
+            if log_positive_sum is None
+            else torch.logaddexp(log_positive_sum, checkpoint_log_positive)
+        )
+
+    if joint_sum is None or log_positive_sum is None:
+        msg = "Ensemble prediction produced no outputs"
+        raise RuntimeError(msg)
+    joint_probabilities = joint_sum / len(models)
+    stable_conditional = torch.softmax(log_positive_sum, dim=-1)
+    return joint_probabilities, stable_conditional
+
+
 @torch.inference_mode()
 def predict_equal_ensemble(
     models: Sequence[Student],
@@ -514,8 +576,8 @@ def predict_equal_ensemble(
     batch_size: int,
     *,
     label: str,
-) -> np.ndarray:
-    """Predict the equal arithmetic mean of full joint distributions."""
+) -> EnsemblePredictionResult:
+    """Predict equal-joint probabilities and stable conditional severity."""
     if not models:
         msg = "At least one model is required"
         raise ValueError(msg)
@@ -523,8 +585,14 @@ def predict_equal_ensemble(
         msg = "batch_size must be positive"
         raise ValueError(msg)
     n_rows = len(features)  # type: ignore[arg-type]
-    output = torch.empty(
+    joint_output = torch.empty(
         (n_rows, N_CLASSES),
+        dtype=torch.float64,
+        device="cpu",
+        pin_memory=device.type == "cuda",
+    )
+    conditional_output = torch.empty(
+        (n_rows, N_CLASSES - 1),
         dtype=torch.float64,
         device="cpu",
         pin_memory=device.type == "cuda",
@@ -539,12 +607,9 @@ def predict_equal_ensemble(
             batch_x = batch_values.to(device)
         else:
             batch_x = torch.from_numpy(np.asarray(batch_values)).to(device)
-        probability_sum = torch.zeros((stop - start, N_CLASSES), dtype=torch.float64, device=device)
-        for model in models:
-            _, detector, _, severity = model(batch_x)
-            probability_sum.add_(model.joint_distribution(detector, severity).to(torch.float64))
-        probability_sum.div_(len(models))
-        output[start:stop].copy_(probability_sum, non_blocking=device.type == "cuda")
+        joint_probabilities, conditional_severity = _ensemble_joint_and_conditional(models, batch_x)
+        joint_output[start:stop].copy_(joint_probabilities.to(torch.float64), non_blocking=device.type == "cuda")
+        conditional_output[start:stop].copy_(conditional_severity, non_blocking=device.type == "cuda")
         if batch_number % progress_every == 0 or batch_number == n_batches:
             _synchronize(device)
             print(
@@ -553,25 +618,57 @@ def predict_equal_ensemble(
                 flush=True,
             )
     _synchronize(device)
-    return output.numpy()
+    return EnsemblePredictionResult(
+        joint_probabilities=joint_output.numpy(),
+        conditional_severity=conditional_output.numpy(),
+    )
 
 
-def _conditional_severity_metrics(probabilities: np.ndarray, labels: np.ndarray) -> dict[str, float]:
+def _conditional_severity_metrics(
+    probabilities: np.ndarray,
+    labels: np.ndarray,
+    conditional_severity: np.ndarray | None,
+) -> dict[str, float | int]:
     """Score the four-class conditional severity distribution on positive rows."""
     positive = labels > 0
     if not np.any(positive):
         msg = "Conditional severity metrics require at least one positive row"
         raise ValueError(msg)
     positive_mass = probabilities[positive, 1:]
-    denominator = positive_mass.sum(axis=1, keepdims=True)
-    conditional = positive_mass / np.maximum(denominator, np.finfo(np.float64).tiny)
-    conditional /= np.maximum(conditional.sum(axis=1, keepdims=True), np.finfo(np.float64).tiny)
-    return probability_metrics(conditional, labels[positive] - 1)
+    denominator = positive_mass.sum(axis=1, dtype=np.float64, keepdims=True)
+    zero_mass_rows = int(np.count_nonzero(denominator[:, 0] == 0.0))
+    if conditional_severity is None:
+        if zero_mass_rows:
+            msg = (
+                "Conditional severity cannot be recovered from joint probabilities with zero positive-class mass; "
+                "supply the stable log-space conditional distribution"
+            )
+            raise ValueError(msg)
+        conditional = positive_mass / denominator
+    else:
+        conditional_severity = np.asarray(conditional_severity)
+        expected_shape = (len(probabilities), N_CLASSES - 1)
+        if conditional_severity.shape != expected_shape:
+            msg = f"conditional_severity must have shape {expected_shape}"
+            raise ValueError(msg)
+        conditional = conditional_severity[positive]
+    metrics = probability_metrics(conditional, labels[positive] - 1)
+    return {
+        **metrics,
+        "joint_positive_mass_zero_rows": zero_mass_rows,
+        "scored_rows": int(np.count_nonzero(positive)),
+    }
 
 
-def score_predictions(probabilities: np.ndarray, labels: np.ndarray, threshold: float) -> dict:
+def score_predictions(
+    probabilities: np.ndarray,
+    labels: np.ndarray,
+    threshold: float,
+    *,
+    conditional_severity: np.ndarray | None = None,
+) -> dict:
     """Return threshold-free and fixed-threshold scores for one prediction matrix."""
-    detector = 1.0 - probabilities[:, 0]
+    detector = probabilities[:, 1:].sum(axis=1, dtype=np.float64)
     positive = labels > 0
     detected = detector >= threshold
     counts = detection_counts(detected, positive)
@@ -589,7 +686,11 @@ def score_predictions(probabilities: np.ndarray, labels: np.ndarray, threshold: 
             ),
             **counts,
         },
-        "conditional_severity_positive_rows": _conditional_severity_metrics(probabilities, labels),
+        "conditional_severity_positive_rows": _conditional_severity_metrics(
+            probabilities,
+            labels,
+            conditional_severity,
+        ),
     }
 
 
@@ -876,7 +977,7 @@ def run_permutation(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         msg = "Validation rows are not an exact number of declared timestep blocks"
         raise ValueError(msg)
 
-    baseline_probabilities = predict_equal_ensemble(
+    baseline_predictions = predict_equal_ensemble(
         inputs.models,
         features,
         device,
@@ -887,7 +988,8 @@ def run_permutation(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
     threshold_source = inputs.threshold_source
     if threshold is None:
         if args.threshold is None:
-            threshold = threshold_at_recall(labels, 1.0 - baseline_probabilities[:, 0], args.target_recall)
+            baseline_detector = baseline_predictions.joint_probabilities[:, 1:].sum(axis=1, dtype=np.float64)
+            threshold = threshold_at_recall(labels, baseline_detector, args.target_recall)
             threshold_source = "fitted once on unperturbed validation ensemble"
         else:
             threshold = args.threshold
@@ -899,9 +1001,14 @@ def run_permutation(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         msg = "threshold must be finite and in [0, 1]"
         raise ValueError(msg)
 
-    baseline = score_predictions(baseline_probabilities, labels, float(threshold))
-    baseline_block_rps = _block_rps(baseline_probabilities, labels, args.block_rows)
-    del baseline_probabilities
+    baseline = score_predictions(
+        baseline_predictions.joint_probabilities,
+        labels,
+        float(threshold),
+        conditional_severity=baseline_predictions.conditional_severity,
+    )
+    baseline_block_rps = _block_rps(baseline_predictions.joint_probabilities, labels, args.block_rows)
+    del baseline_predictions
 
     rows = []
     block_deltas: dict[str, list[np.ndarray]] = {name: [] for name in selected_names}
@@ -913,14 +1020,19 @@ def run_permutation(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
                 continue
             print(f"Permutation repeat {repeat + 1}/{args.repeats}: {group.name}", flush=True)
             permuted = PermutedFeatureMatrix(features, group, row_permutation)
-            probabilities = predict_equal_ensemble(
+            predictions = predict_equal_ensemble(
                 inputs.models,
                 permuted,
                 device,
                 args.batch_size,
                 label=f"repeat {repeat + 1} {group.name}",
             )
-            perturbed = score_predictions(probabilities, labels, float(threshold))
+            perturbed = score_predictions(
+                predictions.joint_probabilities,
+                labels,
+                float(threshold),
+                conditional_severity=predictions.conditional_severity,
+            )
             deltas = importance_deltas(baseline, perturbed)
             rows.append(
                 {
@@ -932,8 +1044,10 @@ def run_permutation(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
                     **deltas,
                 }
             )
-            block_deltas[group.name].append(_block_rps(probabilities, labels, args.block_rows) - baseline_block_rps)
-            del probabilities
+            block_deltas[group.name].append(
+                _block_rps(predictions.joint_probabilities, labels, args.block_rows) - baseline_block_rps
+            )
+            del predictions
 
     summaries = []
     metric_names = tuple(importance_deltas(baseline, baseline))
@@ -984,6 +1098,10 @@ def run_permutation(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
             "conditional_severity_validation_class_support": {
                 str(severity_class): count for severity_class, count in enumerate(class_counts(labels)[1:], start=1)
             },
+            "conditional_severity_numerics": (
+                "detector-weighted equal-joint ensemble conditioned from raw member logits in float64 log space; "
+                "this preserves severity when deployed float32 detector probabilities underflow to zero"
+            ),
         },
         **_common_report(inputs, labels, args.block_rows),
         "threshold": {
@@ -1184,21 +1302,11 @@ def _ensemble_target_function(models: Sequence[Student]) -> Callable[[torch.Tens
         msg = "At least one model is required"
         raise ValueError(msg)
     first_parameter = next(models[0].parameters())
-    positive_classes = torch.arange(1, N_CLASSES, dtype=first_parameter.dtype, device=first_parameter.device)
+    positive_classes = torch.arange(1, N_CLASSES, dtype=torch.float64, device=first_parameter.device)
 
     def forward(inputs: torch.Tensor) -> torch.Tensor:
-        probability_sum = None
-        for model in models:
-            _, detector, _, severity = model(inputs)
-            probabilities = model.joint_distribution(detector, severity)
-            probability_sum = probabilities if probability_sum is None else probability_sum + probabilities
-        if probability_sum is None:
-            msg = "Ensemble target function produced no probabilities"
-            raise RuntimeError(msg)
-        probabilities = probability_sum / len(models)
-        positive_mass = probabilities[:, 1:]
-        detector = positive_mass.sum(dim=1)
-        conditional = positive_mass / detector.unsqueeze(1).clamp_min(torch.finfo(probabilities.dtype).tiny)
+        probabilities, conditional = _ensemble_joint_and_conditional(models, inputs)
+        detector = probabilities[:, 1:].sum(dim=1).to(torch.float64)
         conditional_expected_halvings = conditional @ positive_classes
         return torch.stack((detector, conditional_expected_halvings), dim=1)
 
@@ -1590,6 +1698,10 @@ def run_expected_gradients(args: argparse.Namespace) -> dict:  # noqa: PLR0912, 
                     "E[class | class > 0] over classes 1..4 after averaging full joint checkpoint distributions"
                 ),
             },
+            "conditional_severity_numerics": (
+                "detector-weighted equal-joint ensemble conditioned from raw member logits in float64 log space "
+                "to remain finite under detector-probability underflow"
+            ),
             "model_mode": "evaluation; parameter gradients disabled; input gradients enabled",
             "interpolation_caveat": (
                 "straight-line paths in preprocessed input space may traverse off-manifold combinations and "
