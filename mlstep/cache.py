@@ -1,4 +1,4 @@
-"""Cache preprocessed features and teacher targets for fast iteration."""
+"""Cache preprocessed features and optional teacher targets for fast iteration."""
 
 import argparse
 import json
@@ -31,9 +31,81 @@ PLE64_EMBEDDING_DIM = 12
 PLE64_QUANTILE_SAMPLE_ROWS = 1_048_576
 PLE_IMPORTANCE_TYPE = "total_gain"
 MIN_PLE_BINS = 2
+TIMESTEP_RANGE_PARTS = 2
+MISSING_TIMESTEP_PREVIEW = 8
 
 DEFAULT_OUTPUT_DIR: Final = Path(__file__).resolve().parent / "runs"
 DEFAULT_CACHE_DIR: Final = Path("/rds/user/rc-nand1/hpc-work/mlstep/cache")
+
+
+def parse_timestep_range(value: str) -> tuple[int, ...]:
+    """Parse an inclusive ``START:STOP`` timestep range."""
+    parts = value.split(":")
+    if len(parts) != TIMESTEP_RANGE_PARTS:
+        msg = "timestep ranges must use inclusive START:STOP syntax"
+        raise argparse.ArgumentTypeError(msg)
+    try:
+        start, stop = (int(part) for part in parts)
+    except ValueError as error:
+        msg = "timestep range bounds must be integers"
+        raise argparse.ArgumentTypeError(msg) from error
+    if start < 0 or stop < start:
+        msg = "timestep ranges must be non-negative and STOP must be at least START"
+        raise argparse.ArgumentTypeError(msg)
+    return tuple(range(start, stop + 1))
+
+
+def resolve_timestep_split(
+    discovered: tuple[int, ...],
+    train_steps: tuple[int, ...] | None,
+    validation_steps: tuple[int, ...] | None,
+) -> tuple[tuple[int, ...], tuple[int, ...], str]:
+    """Resolve an explicit chronological split or retain the legacy default."""
+    if train_steps is None and validation_steps is None:
+        train, validation, _ = split_timesteps(discovered)
+        return train, validation, "chronological-70-15-15-v1"
+    if train_steps is None or validation_steps is None:
+        msg = "--train-timesteps and --validation-timesteps must be supplied together"
+        raise ValueError(msg)
+    if not train_steps or not validation_steps:
+        msg = "training and validation timestep ranges must both be non-empty"
+        raise ValueError(msg)
+
+    requested = (*train_steps, *validation_steps)
+    missing = sorted(set(requested).difference(discovered))
+    if missing:
+        preview = ", ".join(str(step) for step in missing[:MISSING_TIMESTEP_PREVIEW])
+        suffix = "..." if len(missing) > MISSING_TIMESTEP_PREVIEW else ""
+        msg = f"requested timesteps are not present after spin-up exclusion: {preview}{suffix}"
+        raise ValueError(msg)
+    overlap = sorted(set(train_steps).intersection(validation_steps))
+    if overlap:
+        msg = f"training and validation timesteps overlap: {overlap[0]}"
+        raise ValueError(msg)
+    if max(train_steps) >= min(validation_steps):
+        msg = "training timesteps must all precede validation timesteps"
+        raise ValueError(msg)
+    return train_steps, validation_steps, "explicit-inclusive-ranges-v1"
+
+
+def resolve_cache_path(args: argparse.Namespace) -> Path:
+    """Return an explicit cache leaf or the backward-compatible default."""
+    cache_path = getattr(args, "cache_path", None)
+    if cache_path is not None:
+        return Path(cache_path)
+    return Path(args.cache_dir) / "week" / args.preprocess
+
+
+def _prepare_cache_directory(cache_dir: Path, teacher_path: Path | None) -> None:
+    """Create the leaf and reject targets stale from a teacherful cache."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    if teacher_path is not None:
+        return
+    stale_teacher_paths = sorted(cache_dir.glob("*_teacher_*.npy"))
+    if stale_teacher_paths:
+        names = ", ".join(path.name for path in stale_teacher_paths)
+        msg = f"Teacherless cache output contains stale teacher targets: {names}"
+        raise FileExistsError(msg)
 
 
 def detector_margin(logits: np.ndarray, delta: float) -> np.ndarray:
@@ -396,13 +468,19 @@ def _save_metadata(
     train_y: np.ndarray,
     val_x: np.ndarray,
     val_y: np.ndarray,
-    teacher_path: Path,
-    delta_t: float,
-    train_class_counts: list[int],
-    train_class_counts_used: list[int],
+    teacher_path: Path | None,
+    delta_t: float | None,
+    train_class_counts: list[int] | None,
+    train_class_counts_used: list[int] | None,
     preprocess_method: str,
     preprocessor: Preprocesser | QuantileTransformer | RobustPreprocesser | StretchPreprocesser | None,
     ple_metadata: dict | None = None,
+    *,
+    data_dir: Path | None = None,
+    discovered_steps: tuple[int, ...] = (),
+    train_steps: tuple[int, ...] = (),
+    validation_steps: tuple[int, ...] = (),
+    split_protocol: str | None = None,
 ) -> None:
     """Save metadata for reproducibility."""
     metadata = {
@@ -415,19 +493,32 @@ def _save_metadata(
             "shape": list(train_x.shape),
             "positives": int((train_y > 0).sum()),
             "class_counts": np.bincount(train_y, minlength=N_CLASSES).tolist(),
+            "timesteps": list(train_steps),
         },
         "val": {
             "shape": list(val_x.shape),
             "positives": int((val_y > 0).sum()),
             "class_counts": np.bincount(val_y, minlength=N_CLASSES).tolist(),
+            "timesteps": list(validation_steps),
         },
-        "teacher": {
+        "split": {
+            "protocol": split_protocol,
+            "data_dir": str(data_dir) if data_dir is not None else None,
+            "discovered_timesteps": list(discovered_steps),
+            "unused_timesteps": sorted(set(discovered_steps).difference((*train_steps, *validation_steps))),
+        },
+        "teacher": None,
+    }
+    if teacher_path is not None:
+        if delta_t is None or train_class_counts is None or train_class_counts_used is None:
+            msg = "complete teacher metadata is required when teacher_path is set"
+            raise ValueError(msg)
+        metadata["teacher"] = {
             "path": str(teacher_path),
             "delta_t": float(delta_t),
             "train_class_counts": train_class_counts,
             "train_class_counts_used": train_class_counts_used,
-        },
-    }
+        }
     if ple_metadata is not None:
         metadata["piecewise_linear_embedding"] = {
             "version": str(ple_metadata["version"]),
@@ -515,11 +606,27 @@ def _preprocessing_metadata(
 
 def run(args: argparse.Namespace) -> None:
     """Execute the caching pipeline."""
-    # Discover and split timesteps
+    teacher_path = getattr(args, "teacher_path", None)
+    if args.preprocess == "ple64" and teacher_path is None:
+        msg = "PLE64 cache generation requires --teacher-path for feature selection"
+        raise ValueError(msg)
+
+    # Discover and split timesteps. Explicit ranges ensure the HPO cache never
+    # reads the later locked-test period.
     timesteps = discover_timesteps(args.data_dir)
-    train_steps, val_steps, _ = split_timesteps(timesteps)
+    train_steps, val_steps, split_protocol = resolve_timestep_split(
+        timesteps,
+        getattr(args, "train_timesteps", None),
+        getattr(args, "validation_timesteps", None),
+    )
     print(f"Train: t{train_steps[0]}-t{train_steps[-1]} ({len(train_steps)} steps)")
     print(f"Val: t{val_steps[0]}-t{val_steps[-1]} ({len(val_steps)} steps)")
+
+    # Resolve and validate the destination before allocating the raw matrices.
+    # In particular, a teacherless rebuild must not silently retain targets
+    # from an older teacherful cache at the same path.
+    cache_dir = resolve_cache_path(args)
+    _prepare_cache_directory(cache_dir, teacher_path)
 
     # Load the raw features
     train_x, train_y, val_x, val_y = _load_features(
@@ -528,15 +635,17 @@ def run(args: argparse.Namespace) -> None:
         val_steps,
     )
 
-    # Create variant specific directory
-    cache_dir = args.cache_dir / "week" / args.preprocess
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    # Load the raw-feature teacher
-    teacher, train_cc, train_cc_used, delta_t = _load_teacher(args.teacher_path)
-
-    # Compute and save teacher targets
-    _compute_and_save_teacher_targets(cache_dir, teacher, train_x, val_x, delta_t)
+    teacher = None
+    train_cc = None
+    train_cc_used = None
+    delta_t = None
+    if teacher_path is not None:
+        # Teacher targets remain available for the existing distillation and
+        # PLE workflows, but a supervised Stretch128 cache does not need them.
+        teacher, train_cc, train_cc_used, delta_t = _load_teacher(teacher_path)
+        _compute_and_save_teacher_targets(cache_dir, teacher, train_x, val_x, delta_t)
+    else:
+        print("No teacher supplied; writing a supervised-only cache.")
 
     # Teacher inference is finished, so the arrays may now be transformed.
     preprocessor, train_x_processed, val_x_processed = _preprocess_features(
@@ -550,6 +659,9 @@ def run(args: argparse.Namespace) -> None:
     # not the raw coordinate system used by the XGBoost teacher.
     ple_metadata = None
     if args.preprocess == "ple64":
+        if teacher is None:
+            msg = "PLE64 feature selection requires a loaded teacher"
+            raise RuntimeError(msg)
         print("\nComputing PLE64 metadata on physically transformed training inputs...")
         ple_indices, ple_importance, excluded_indices = _select_top_features(
             teacher,
@@ -613,13 +725,18 @@ def run(args: argparse.Namespace) -> None:
         train_y,
         val_x_processed,
         val_y,
-        args.teacher_path,
+        teacher_path,
         delta_t,
         train_cc,
         train_cc_used,
         args.preprocess,
         preprocessor,
         ple_metadata,
+        data_dir=args.data_dir,
+        discovered_steps=timesteps,
+        train_steps=train_steps,
+        validation_steps=val_steps,
+        split_protocol=split_protocol,
     )
 
     # Summary
@@ -646,10 +763,24 @@ def parse_args() -> argparse.Namespace:
         help="Directory to save cached arrays",
     )
     parser.add_argument(
+        "--cache-path",
+        type=Path,
+        help="Exact cache output directory; overrides --cache-dir/week/PREPROCESS",
+    )
+    parser.add_argument(
         "--teacher-path",
         type=Path,
-        required=True,
-        help="Path to XGBoost .ubj teacher model",
+        help="Optional XGBoost .ubj teacher model; required only for PLE64 or distillation targets",
+    )
+    parser.add_argument(
+        "--train-timesteps",
+        type=parse_timestep_range,
+        help="Inclusive training range as START:STOP; requires --validation-timesteps",
+    )
+    parser.add_argument(
+        "--validation-timesteps",
+        type=parse_timestep_range,
+        help="Inclusive validation range as START:STOP; requires --train-timesteps",
     )
     parser.add_argument(
         "--preprocess",

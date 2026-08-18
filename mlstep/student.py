@@ -42,6 +42,15 @@ DEFAULT_OUTPUT_DIR: Final = Path(__file__).resolve().parent / "runs"
 # NOTE: change the directory (update to make all three directories accessible)
 DEFAULT_CACHE_DIR: Final = Path("/rds/user/rc-nand1/hpc-work/mlstep/cache")
 
+
+def resolve_cache_path(args: argparse.Namespace) -> Path:
+    """Return an explicit cache leaf or the backward-compatible default."""
+    cache_path = getattr(args, "cache_path", None)
+    if cache_path is not None:
+        return Path(cache_path)
+    return Path(args.cache_dir) / "week" / args.preprocess
+
+
 # Architecture defaults
 ARCHITECTURES: Final = ("mlp", "tabm-mini")
 DEFAULT_ARCHITECTURE: Final = "mlp"
@@ -711,6 +720,28 @@ def _load_array_resident(path: Path) -> np.ndarray:
                 flush=True,
             )
     return destination
+
+
+def _load_optional_teacher_pair(
+    cache_dir: Path,
+    split: str,
+    *,
+    required: bool,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Load one cached teacher-response pair, preserving pairwise integrity."""
+    margin_path = cache_dir / f"{split}_teacher_margin.npy"
+    severity_path = cache_dir / f"{split}_teacher_severity.npy"
+    margin_exists = margin_path.is_file()
+    severity_exists = severity_path.is_file()
+    if margin_exists != severity_exists:
+        msg = f"{split.capitalize()} teacher margin and severity caches must both be present"
+        raise ValueError(msg)
+    if not margin_exists:
+        if required:
+            msg = f"Distillation requires {split} teacher targets in {cache_dir}"
+            raise FileNotFoundError(msg)
+        return None, None
+    return _load_array_resident(margin_path), _load_array_resident(severity_path)
 
 
 def _place_feature_matrices(
@@ -1693,8 +1724,8 @@ def _validate_cache_shapes(
     val_y: np.ndarray,
     train_teacher_margin: np.ndarray | None,
     train_teacher_severity: np.ndarray | None,
-    val_teacher_margin: np.ndarray,
-    val_teacher_severity: np.ndarray,
+    val_teacher_margin: np.ndarray | None,
+    val_teacher_severity: np.ndarray | None,
 ) -> None:
     """Check the inexpensive cache-shape invariants needed for training."""
     if train_x.ndim != MATRIX_NDIM or val_x.ndim != MATRIX_NDIM:
@@ -1725,12 +1756,16 @@ def _validate_cache_shapes(
             len(train_y),
             "Training",
         )
-    _validate_teacher_cache(
-        val_teacher_margin,
-        val_teacher_severity,
-        len(val_y),
-        "Validation",
-    )
+    if (val_teacher_margin is None) != (val_teacher_severity is None):
+        msg = "Validation teacher margin and severity caches must both be present"
+        raise ValueError(msg)
+    if val_teacher_margin is not None and val_teacher_severity is not None:
+        _validate_teacher_cache(
+            val_teacher_margin,
+            val_teacher_severity,
+            len(val_y),
+            "Validation",
+        )
 
 
 def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
@@ -1738,6 +1773,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
     # Preserve programmatic callers created before cache placement became a
     # configurable command-line option.
     backward_compatible_defaults = {
+        "cache_path": None,
         "cache_residency": DEFAULT_CACHE_RESIDENCY,
         "lambda_sev": DEFAULT_LAMBDA_SEV,
         "kd_temperature": DEFAULT_KD_TEMPERATURE,
@@ -1751,10 +1787,34 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
 
-    # Determine cache directory based on preprocessing method
-    cache_dir = args.cache_dir / "week" / args.preprocess
+    cache_dir = resolve_cache_path(args)
 
     print(f"Loading cache from: {cache_dir}", flush=True)
+
+    # Validate inexpensive provenance before allocating roughly 80 GiB for the
+    # 15-day experiment.
+    metadata_path = cache_dir / "metadata.json"
+    with open(metadata_path) as f:
+        metadata = json.load(f)
+    recorded_preprocess = metadata.get("preprocess")
+    if recorded_preprocess is not None and recorded_preprocess != args.preprocess:
+        msg = f"Cache metadata records preprocessing {recorded_preprocess!r}, but the run requested {args.preprocess!r}"
+        raise ValueError(msg)
+    teacher_metadata = metadata.get("teacher")
+    teacher_presence = {
+        split: tuple((cache_dir / f"{split}_teacher_{kind}.npy").is_file() for kind in ("margin", "severity"))
+        for split in ("train", "val")
+    }
+    for split, (margin_exists, severity_exists) in teacher_presence.items():
+        if margin_exists != severity_exists:
+            msg = f"{split.capitalize()} teacher margin and severity caches must both be present"
+            raise ValueError(msg)
+    if teacher_metadata is None and any(present for pair in teacher_presence.values() for present in pair):
+        msg = "Cache metadata is teacherless but teacher-response files are present"
+        raise ValueError(msg)
+    if args.distill and not all(teacher_presence["train"]):
+        msg = f"Distillation requires cached training teacher targets in {cache_dir}"
+        raise FileNotFoundError(msg)
 
     # Read each cache once in sequential chunks. Repeated random access to an
     # RDS-backed mmap was the dominant bottleneck for the week experiment.
@@ -1767,18 +1827,22 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
     print(f"Train: {train_x_host.shape}, {train_x_host.nbytes / 2**20:.1f} MiB (resident)")
     print(f"Val: {val_x_host.shape}, {val_x_host.nbytes / 2**20:.1f} MiB (resident)")
 
-    # Validation responses are loaded for both controls so teacher fidelity and
-    # student agreement are directly comparable. Training responses are needed
-    # only by distilled cells.
-    train_teacher_margin = None
-    train_teacher_severity = None
     if args.distill:
-        print("Loading training teacher targets...", flush=True)
-        train_teacher_margin = _load_array_resident(cache_dir / "train_teacher_margin.npy")
-        train_teacher_severity = _load_array_resident(cache_dir / "train_teacher_severity.npy")
-    print("Loading validation teacher targets...", flush=True)
-    val_teacher_margin = _load_array_resident(cache_dir / "val_teacher_margin.npy")
-    val_teacher_severity = _load_array_resident(cache_dir / "val_teacher_severity.npy")
+        train_teacher_margin, train_teacher_severity = _load_optional_teacher_pair(
+            cache_dir,
+            "train",
+            required=True,
+        )
+    else:
+        # Supervised training never consumes training teacher responses, even
+        # when an older cache happens to contain them.
+        train_teacher_margin = None
+        train_teacher_severity = None
+    val_teacher_margin, val_teacher_severity = _load_optional_teacher_pair(
+        cache_dir,
+        "val",
+        required=False,
+    )
 
     cache_load_seconds = time.perf_counter() - cache_load_start
     print(f"Cache loaded into host RAM in {cache_load_seconds:.1f}s", flush=True)
@@ -1794,18 +1858,13 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         val_teacher_severity,
     )
 
-    metadata_path = cache_dir / "metadata.json"
-    with open(metadata_path) as f:
-        metadata = json.load(f)
-    recorded_preprocess = metadata.get("preprocess")
-    if recorded_preprocess is not None and recorded_preprocess != args.preprocess:
-        msg = f"Cache metadata records preprocessing {recorded_preprocess!r}, but the run requested {args.preprocess!r}"
-        raise ValueError(msg)
     if metadata.get("n_features", train_x_host.shape[1]) != train_x_host.shape[1]:
         msg = "Cache metadata feature count does not match the feature arrays"
         raise ValueError(msg)
-    delta_t = metadata["teacher"]["delta_t"]
-    print(f"Teacher delta_T: {delta_t:.4f}")
+    if isinstance(teacher_metadata, dict) and "delta_t" in teacher_metadata:
+        print(f"Teacher delta_T: {float(teacher_metadata['delta_t']):.4f}")
+    else:
+        print("No cached teacher responses; supervised diagnostics only.")
 
     # The model emits a population margin. Adding delta_s maps it to the
     # sampled-data prior used by the detector's hard-label BCE.
@@ -1929,6 +1988,11 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         "cache_residency": cache_residency,
     }
     training_protocol = {
+        "data_split": {
+            "split": metadata.get("split"),
+            "train_timesteps": metadata.get("train", {}).get("timesteps"),
+            "validation_timesteps": metadata.get("val", {}).get("timesteps"),
+        },
         "negative_sampling": {
             "policy": "uniform random undersampling without replacement per epoch",
             "epoch_seed_policy": SAMPLING_SEED_POLICY,
@@ -2246,21 +2310,24 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         "achieved_recall": float(final_metrics["recall"]),
     }
     diagnostics_start = time.perf_counter()
-    teacher_validation = teacher_validation_diagnostics(
-        val_teacher_margin,
-        val_teacher_severity,
-        val_y,
-        args.target_recall,
-    )
-    teacher_agreement = student_teacher_agreement(
-        final_probabilities,
-        final_detector_probability,
-        val_teacher_margin,
-        val_teacher_severity,
-        val_y,
-        best_threshold,
-        float(teacher_validation["metrics"]["threshold"]),
-    )
+    teacher_validation = None
+    teacher_agreement = None
+    if val_teacher_margin is not None and val_teacher_severity is not None:
+        teacher_validation = teacher_validation_diagnostics(
+            val_teacher_margin,
+            val_teacher_severity,
+            val_y,
+            args.target_recall,
+        )
+        teacher_agreement = student_teacher_agreement(
+            final_probabilities,
+            final_detector_probability,
+            val_teacher_margin,
+            val_teacher_severity,
+            val_y,
+            best_threshold,
+            float(teacher_validation["metrics"]["threshold"]),
+        )
     member_diagnostics = member_ensemble_diagnostics(
         model,
         val_x,
@@ -2290,7 +2357,9 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         "delta_s": delta_s,
     }
     diagnostic_protocol = {
-        "teacher_validation_targets": "required for all supervised and distilled cells",
+        "teacher_validation_targets": (
+            "available" if teacher_validation is not None else "not present in supervised cache"
+        ),
         "member_diagnostics": "full-validation AP/action metrics plus hard-subset diversity",
         "epsilon_policy": EPSILON_POLICY_VERSION,
         "fixed_recall_detector": {
@@ -2477,18 +2546,19 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
     print(f"Frozen threshold: {best_threshold:.6g}")
     print(f"Exact on positives: {final_metrics['severity']['exact_on_positive']:.4f}")
     print(f"All-row overprediction rate: {final_metrics['severity']['overprediction_rate_all']:.6f}")
-    print(
-        "Cached teacher validation: "
-        f"AP {teacher_validation['detector_ap']:.6f} | "
-        "conditional severity exact "
-        f"{teacher_validation['conditional_severity_exact_on_true_positives']:.4f}"
-    )
-    print(
-        "Student/teacher agreement: "
-        f"joint KL {teacher_agreement['joint_kl_teacher_to_student_all']:.6g} | "
-        "positive severity agreement "
-        f"{teacher_agreement['conditional_severity_top1_agreement_on_true_positives']:.4f}"
-    )
+    if teacher_validation is not None and teacher_agreement is not None:
+        print(
+            "Cached teacher validation: "
+            f"AP {teacher_validation['detector_ap']:.6f} | "
+            "conditional severity exact "
+            f"{teacher_validation['conditional_severity_exact_on_true_positives']:.4f}"
+        )
+        print(
+            "Student/teacher agreement: "
+            f"joint KL {teacher_agreement['joint_kl_teacher_to_student_all']:.6g} | "
+            "positive severity agreement "
+            f"{teacher_agreement['conditional_severity_top1_agreement_on_true_positives']:.4f}"
+        )
     print(
         "Member ensemble diagnostic: "
         f"AP gain over mean member {member_diagnostics['ensemble']['ap_gain_over_mean_member']:.6g}"
@@ -2511,6 +2581,11 @@ def parse_args() -> argparse.Namespace:
 
     # Data paths
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR, help="Cache directory")
+    parser.add_argument(
+        "--cache-path",
+        type=Path,
+        help="Exact cache directory; overrides --cache-dir/week/PREPROCESS",
+    )
     parser.add_argument(
         "--preprocess",
         default="physical",
