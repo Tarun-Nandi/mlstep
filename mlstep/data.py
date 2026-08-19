@@ -42,7 +42,7 @@ FEATURES = (
     Feature("cell_volume", 1, "standard"),
     Feature("stratflag", 1, "standard"),
     Feature("tracer", 83, "log1p"),
-    Feature("rhs", 83, "arcsinh"),
+    Feature("residual", 83, "arcsinh"),
     Feature("photol_rates", 60, "log1p"),
     Feature("wetrt", 34, "log1p"),
 )
