@@ -11,7 +11,12 @@ import sklearn
 from sklearn.metrics import average_precision_score
 
 from mlstep.data import Feature, class_counts, feature_names
-from mlstep.policy import EpsilonPolicy, boundary_probabilities, validate_probabilities
+from mlstep.policy import (
+    AsymmetricExactOverpredictionPolicy,
+    EpsilonPolicy,
+    boundary_probabilities,
+    validate_probabilities,
+)
 
 TOP_FRACTION = 0.001
 PROBABILITY_NDIM = 2  # a probability matrix is two dimensional: (rows, classes)
@@ -429,6 +434,103 @@ def halving_action_metrics(
             counts["true_positive"],
         ),
     }
+
+
+def asymmetric_exact_overprediction_cost(
+    actions: np.ndarray,
+    targets: np.ndarray,
+    overprediction_penalty: float,
+) -> dict[str, float | int]:
+    """Evaluate ``1[a != y] + lambda * max(a-y, 0)`` on hard actions."""
+    policy = AsymmetricExactOverpredictionPolicy(overprediction_penalty)
+    metrics = halving_action_metrics(actions, targets, n_classes=5)
+    return _asymmetric_cost_from_action_metrics(metrics, policy.overprediction_penalty)
+
+
+def _asymmetric_cost_from_action_metrics(
+    metrics: dict,
+    overprediction_penalty: float,
+) -> dict[str, float | int]:
+    """Compute one empirical objective from already-reduced action metrics."""
+    total = int(sum(metrics["support_by_class"]))
+    inexact_count = total - int(metrics["exact_count_all"])
+    overprediction_level_sum = int(metrics["overprediction_level_sum_all"])
+    total_cost = inexact_count + overprediction_penalty * overprediction_level_sum
+    return {
+        "rows": total,
+        "inexact_count": inexact_count,
+        "inexact_rate": inexact_count / total,
+        "overprediction_level_sum": overprediction_level_sum,
+        "overprediction_level_mean": overprediction_level_sum / total,
+        "lambda": overprediction_penalty,
+        "total_cost": total_cost,
+        "mean_cost": total_cost / total,
+    }
+
+
+def asymmetric_policy_frontier(
+    probabilities: np.ndarray,
+    targets: np.ndarray,
+    overprediction_penalties: tuple[float, ...] | list[float],
+) -> list[dict]:
+    """Evaluate and mark nondominated asymmetric posterior-risk policies.
+
+    Nondominance is empirical on the supplied labels: a policy is dominated
+    only when another makes no more inexact predictions on positive rows and
+    no more excess-halving levels overall, with a strict improvement in at
+    least one quantity. This avoids the meaningless all-zero optimum induced
+    by the roughly 1:10,000 class prevalence. The helper does not select a
+    deployment penalty or claim held-out performance.
+    """
+    raw_penalties = tuple(overprediction_penalties)
+    if not raw_penalties:
+        msg = "at least one overprediction penalty is required"
+        raise ValueError(msg)
+
+    policies_by_penalty = {
+        policy.overprediction_penalty: policy
+        for value in raw_penalties
+        for policy in (AsymmetricExactOverpredictionPolicy(value),)
+    }
+    entries = []
+    for penalty in sorted(policies_by_penalty):
+        policy = policies_by_penalty[penalty]
+        actions = policy.predict(probabilities)
+        metrics = halving_action_metrics(actions, targets, n_classes=5)
+        objective = _asymmetric_cost_from_action_metrics(
+            metrics,
+            policy.overprediction_penalty,
+        )
+        positive_rows = int(sum(metrics["support_by_class"][1:]))
+        positive_inexact_count = positive_rows - int(metrics["exact_on_positive_count"])
+        entries.append(
+            {
+                "policy": policy.to_descriptor(),
+                "empirical_objective": objective,
+                "pareto_coordinates": {
+                    "positive_inexact_count": positive_inexact_count,
+                    "overprediction_level_sum_all": int(metrics["overprediction_level_sum_all"]),
+                },
+                "metrics": metrics,
+            }
+        )
+
+    for candidate in entries:
+        candidate_inexact = candidate["pareto_coordinates"]["positive_inexact_count"]
+        candidate_over = candidate["pareto_coordinates"]["overprediction_level_sum_all"]
+        candidate["nondominated"] = not any(
+            (
+                other["pareto_coordinates"]["positive_inexact_count"] <= candidate_inexact
+                and other["pareto_coordinates"]["overprediction_level_sum_all"] <= candidate_over
+                and (
+                    other["pareto_coordinates"]["positive_inexact_count"] < candidate_inexact
+                    or other["pareto_coordinates"]["overprediction_level_sum_all"] < candidate_over
+                )
+            )
+            for other in entries
+            if other is not candidate
+        )
+    return entries
 
 
 def exact_halvings_metrics(outputs: np.ndarray, targets: np.ndarray, detected: np.ndarray) -> dict:
