@@ -28,6 +28,7 @@ from mlstep.evaluation import (
     halving_action_metrics,
     output_paths,
     probability_metrics,
+    recall_action_frontier,
     threshold_at_recall,
     write_json,
 )
@@ -80,9 +81,10 @@ DEFAULT_TARGET_RECALL: Final = 0.97
 NEGATIVE_SAMPLING_POLICIES: Final = ("random", "cyclic", "hard")
 DEFAULT_NEGATIVE_SAMPLING: Final = "random"
 DEFAULT_HARD_NEGATIVE_FRACTION: Final = 0.25
-ACTION_POLICIES: Final = ("posterior-risk", "legacy-recall")
+ACTION_POLICIES: Final = ("posterior-risk", "recall-frontier", "legacy-recall")
 DEFAULT_ACTION_POLICY: Final = "legacy-recall"
 DEFAULT_POLICY_LAMBDAS: Final = (0.0, 0.25, 0.5, 1.0, 2.0)
+DEFAULT_RECALL_TARGETS: Final = (0.50, 0.60, 0.70, 0.80, 0.90, 0.95, 0.97)
 CACHE_RESIDENCIES: Final = ("auto", "host", "cuda")
 DEFAULT_CACHE_RESIDENCY: Final = "auto"
 DEFAULT_LAMBDA_SEV: Final = 0.1
@@ -1830,27 +1832,20 @@ def epsilon_policy_diagnostic(
     }
 
 
-def posterior_policy_diagnostics(
+def _probabilistic_final_metrics(
     probabilities: np.ndarray,
     detector_probabilities: np.ndarray,
     labels: np.ndarray,
-    penalties: list[float] | tuple[float, ...],
-) -> tuple[dict, dict, list[dict]]:
-    """Evaluate recall-independent exact actions without selecting a cost."""
+) -> dict:
+    """Build threshold-free joint and conditional probability diagnostics."""
     labels = np.asarray(labels)
-    joint_map = JointMapPolicy()
-    joint_map_metrics = halving_action_metrics(
-        joint_map.predict(probabilities),
-        labels,
-        n_classes=N_CLASSES,
-    )
     positive = labels > 0
     positive_mass = probabilities[positive, 1:].sum(axis=1, keepdims=True)
     conditional = probabilities[positive, 1:] / np.maximum(
         positive_mass,
         np.finfo(np.float64).tiny,
     )
-    metrics = {
+    return {
         "ap": detection_ap(detector_probabilities, labels),
         "prevalence": float(positive.mean()),
         "positive_examples": int(positive.sum()),
@@ -1859,8 +1854,23 @@ def posterior_policy_diagnostics(
             conditional,
             labels[positive] - 1,
         ),
-        "severity": joint_map_metrics,
     }
+
+
+def posterior_policy_diagnostics(
+    probabilities: np.ndarray,
+    detector_probabilities: np.ndarray,
+    labels: np.ndarray,
+    penalties: list[float] | tuple[float, ...],
+) -> tuple[dict, dict, list[dict]]:
+    """Evaluate recall-independent exact actions without selecting a cost."""
+    metrics = _probabilistic_final_metrics(probabilities, detector_probabilities, labels)
+    joint_map = JointMapPolicy()
+    metrics["severity"] = halving_action_metrics(
+        joint_map.predict(probabilities),
+        labels,
+        n_classes=N_CLASSES,
+    )
     frontier = asymmetric_policy_frontier(probabilities, labels, penalties)
     action_policy = {
         "version": "posterior-risk-frontier-v1",
@@ -1869,6 +1879,35 @@ def posterior_policy_diagnostics(
         "candidate_lambdas": sorted({float(value) for value in penalties}),
         "selection": "not selected; report the validation trade-off frontier until a policy is predeclared",
         "validation_labels_required_at_inference": False,
+    }
+    return metrics, action_policy, frontier
+
+
+def recall_frontier_diagnostics(
+    probabilities: np.ndarray,
+    detector_probabilities: np.ndarray,
+    labels: np.ndarray,
+    target_recalls: list[float] | tuple[float, ...],
+) -> tuple[dict, dict, list[dict]]:
+    """Evaluate an unselected exact-action frontier at fixed detector recalls."""
+    metrics = _probabilistic_final_metrics(probabilities, detector_probabilities, labels)
+    frontier = recall_action_frontier(
+        probabilities,
+        detector_probabilities,
+        labels,
+        target_recalls,
+    )
+    action_policy = {
+        "version": "recall-constrained-frontier-v1",
+        "uses_recall_threshold": True,
+        "threshold_rule": THRESHOLD_RULE,
+        "score": THRESHOLD_SCORE,
+        "thresholds_fitted_on": "validation after probabilistic checkpoint selection",
+        "candidate_target_recalls": [entry["target_recall"] for entry in frontier],
+        "selection": "not selected; freeze one development operating point before locked testing",
+        "validation_labels_required_to_fit_thresholds": True,
+        "validation_labels_required_at_inference": False,
+        "severity_decision": SEVERITY_DECISION,
     }
     return metrics, action_policy, frontier
 
@@ -1905,6 +1944,10 @@ def _validate_model_args(args: argparse.Namespace) -> None:
 
 def _validate_args(args: argparse.Namespace) -> None:  # noqa: PLR0912, PLR0915
     """Reject invalid training settings before loading a large cache."""
+    # Backfill the new diagnostic grid for older programmatic callers that
+    # construct an argparse.Namespace directly rather than using parse_args.
+    if not hasattr(args, "recall_targets"):
+        args.recall_targets = list(DEFAULT_RECALL_TARGETS)
     positive_integer_arguments = {
         "epochs": args.epochs,
         "patience": args.patience,
@@ -1948,14 +1991,27 @@ def _validate_args(args: argparse.Namespace) -> None:  # noqa: PLR0912, PLR0915
     if args.negative_sampling == "hard" and args.distill:
         msg = "Hard-negative experiments currently require supervised training"
         raise ValueError(msg)
-    if not args.policy_lambdas or any(not np.isfinite(value) or value < 0.0 for value in args.policy_lambdas):
-        msg = "policy-lambdas must contain finite non-negative values"
-        raise ValueError(msg)
-    if args.action_policy == "posterior-risk" and 0.0 not in args.policy_lambdas:
-        msg = "posterior-risk policy-lambdas must include 0 for the joint-MAP baseline"
-        raise ValueError(msg)
-    if args.action_policy == "posterior-risk" and args.save_fp97_best_checkpoint:
-        msg = "FP@97 checkpointing is incompatible with recall-independent actions"
+    if args.action_policy == "posterior-risk":
+        if not args.policy_lambdas or any(not np.isfinite(value) or value < 0.0 for value in args.policy_lambdas):
+            msg = "policy-lambdas must contain finite non-negative values"
+            raise ValueError(msg)
+        if 0.0 not in args.policy_lambdas:
+            msg = "posterior-risk policy-lambdas must include 0 for the joint-MAP baseline"
+            raise ValueError(msg)
+    if args.action_policy == "recall-frontier":
+        if not args.recall_targets:
+            msg = "recall-targets must contain at least one value"
+            raise ValueError(msg)
+        recalls = [float(value) for value in args.recall_targets]
+        if any(not np.isfinite(value) or not 0.0 < value <= 1.0 for value in recalls):
+            msg = "recall-targets must contain finite values in (0, 1]"
+            raise ValueError(msg)
+        if recalls != sorted(recalls) or len(set(recalls)) != len(recalls):
+            msg = "recall-targets must be strictly increasing and unique"
+            raise ValueError(msg)
+        args.recall_targets = recalls
+    if args.action_policy != "legacy-recall" and args.save_fp97_best_checkpoint:
+        msg = "FP@97 checkpointing is only available with legacy-recall actions"
         raise ValueError(msg)
     if args.action_policy == "legacy-recall" and not 0.0 < args.target_recall <= 1.0:
         msg = "target-recall must be in (0, 1]"
@@ -2062,6 +2118,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         "hard_negative_fraction": DEFAULT_HARD_NEGATIVE_FRACTION,
         "action_policy": "legacy-recall",
         "policy_lambdas": list(DEFAULT_POLICY_LAMBDAS),
+        "recall_targets": list(DEFAULT_RECALL_TARGETS),
     }
     for name, default in backward_compatible_defaults.items():
         if not hasattr(args, name):
@@ -2387,6 +2444,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
     best_fp97_state = None
     history = []
     recall_controlled = args.action_policy == "legacy-recall"
+    recall_frontier_mode = args.action_policy == "recall-frontier"
 
     print(f"\nTraining for {args.epochs} epochs with patience {args.patience}")
     print(f"Architecture: {args.architecture}")
@@ -2400,6 +2458,8 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
     print(f"Conditional ordinal RPS weight: {args.lambda_ordinal:g}")
     if recall_controlled:
         print(f"Legacy post-checkpoint target detector recall: {args.target_recall:.1%}")
+    elif recall_frontier_mode:
+        print(f"Post-checkpoint detector-recall frontier: {args.recall_targets}")
     else:
         print(f"Recall-independent posterior policies: lambdas={args.policy_lambdas}")
     print(f"Checkpoint policy: {SELECTION_POLICY}")
@@ -2632,6 +2692,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
     threshold_policy = None
     action_policy = None
     policy_frontier = None
+    recall_frontier = None
     if recall_controlled:
         threshold_source = "selected after probabilistic checkpoint selection on validation set"
         final_metrics = evaluate(
@@ -2654,6 +2715,13 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
             "threshold": best_threshold,
             "achieved_recall": float(final_metrics["recall"]),
         }
+    elif recall_frontier_mode:
+        final_metrics, action_policy, recall_frontier = recall_frontier_diagnostics(
+            final_probabilities,
+            final_detector_probability,
+            val_y,
+            args.recall_targets,
+        )
     else:
         final_metrics, action_policy, policy_frontier = posterior_policy_diagnostics(
             final_probabilities,
@@ -2730,6 +2798,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         "hard_negative_fraction": (args.hard_negative_fraction if args.negative_sampling == "hard" else None),
         "lambda_ordinal": args.lambda_ordinal,
         "action_policy": args.action_policy,
+        "recall_targets": (list(args.recall_targets) if recall_frontier_mode else None),
     }
     diagnostic_protocol = {
         "teacher_validation_targets": (
@@ -2901,6 +2970,10 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
     if not recall_controlled:
         reported_config.pop("target_recall", None)
         reported_config.pop("save_fp97_best_checkpoint", None)
+    if not recall_frontier_mode:
+        reported_config.pop("recall_targets", None)
+    if args.action_policy != "posterior-risk":
+        reported_config.pop("policy_lambdas", None)
     result = {
         "model_format_version": MODEL_FORMAT_VERSION,
         "task": task,
@@ -2937,6 +3010,13 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
                 "epsilon_policy_diagnostic": policy_diagnostic,
             }
         )
+    elif recall_frontier_mode:
+        result.update(
+            {
+                "action_policy": action_policy,
+                "recall_frontier": recall_frontier,
+            }
+        )
     else:
         result.update(
             {
@@ -2961,10 +3041,13 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
     print(f"Best epoch: {best_epoch}")
     if recall_controlled:
         print(f"Frozen legacy recall threshold: {best_threshold:.6g}")
+    elif recall_frontier_mode:
+        print("Action policy: unselected detector-recall frontier")
     else:
         print("Action policy: joint MAP plus unselected asymmetric posterior-risk frontier")
-    print(f"Exact on positives: {final_metrics['severity']['exact_on_positive']:.4f}")
-    print(f"All-row overprediction rate: {final_metrics['severity']['overprediction_rate_all']:.6f}")
+    if "severity" in final_metrics:
+        print(f"Exact on positives: {final_metrics['severity']['exact_on_positive']:.4f}")
+        print(f"All-row overprediction rate: {final_metrics['severity']['overprediction_rate_all']:.6f}")
     if teacher_validation is not None and teacher_agreement is not None:
         print(
             "Cached teacher validation: "
@@ -2991,6 +3074,16 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
             f"exact+ {reference_policy['metrics']['exact_on_positive']:.4f} | "
             f"over(all) {reference_policy['metrics']['overprediction_rate_all']:.6f}"
         )
+    elif recall_frontier is not None:
+        for entry in recall_frontier:
+            metrics = entry["metrics"]
+            print(
+                f"  target recall={entry['target_recall']:.0%} | "
+                f"achieved {entry['achieved_recall']:.4f} | "
+                f"precision {entry['precision']:.4f} | "
+                f"FP {entry['false_positive']} | "
+                f"exact+ {metrics['exact_on_positive']:.4f}"
+            )
     elif policy_frontier is not None:
         for entry in policy_frontier:
             policy = entry["policy"]
@@ -3080,13 +3173,20 @@ def parse_args() -> argparse.Namespace:
         "--target-recall",
         type=float,
         default=DEFAULT_TARGET_RECALL,
-        help="Legacy-only recall target; ignored by posterior-risk actions",
+        help="Single target used only by the legacy-recall reproduction path",
     )
     parser.add_argument(
         "--action-policy",
         choices=ACTION_POLICIES,
         default=DEFAULT_ACTION_POLICY,
-        help="Recall-independent posterior-risk actions or explicit legacy reproduction",
+        help="Post-checkpoint action diagnostics or explicit legacy reproduction",
+    )
+    parser.add_argument(
+        "--recall-targets",
+        type=float,
+        nargs="+",
+        default=list(DEFAULT_RECALL_TARGETS),
+        help="Strictly increasing detector-recall grid for recall-frontier evaluation",
     )
     parser.add_argument(
         "--policy-lambdas",

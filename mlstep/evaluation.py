@@ -12,6 +12,7 @@ from sklearn.metrics import average_precision_score
 
 from mlstep.data import Feature, class_counts, feature_names
 from mlstep.policy import (
+    HALVING_N_CLASSES,
     AsymmetricExactOverpredictionPolicy,
     EpsilonPolicy,
     boundary_probabilities,
@@ -531,6 +532,113 @@ def asymmetric_policy_frontier(
             if other is not candidate
         )
     return entries
+
+
+def _validated_recall_grid(target_recalls: tuple[float, ...] | list[float]) -> list[float]:
+    """Return a finite, strictly increasing detector-recall grid."""
+    raw_targets = tuple(target_recalls)
+    if not raw_targets:
+        msg = "at least one target recall is required"
+        raise ValueError(msg)
+    recalls = []
+    for recall in raw_targets:
+        if isinstance(recall, (bool, np.bool_)):
+            msg = "target recalls must be finite values in (0, 1]"
+            raise ValueError(msg)
+        try:
+            value = float(recall)
+        except (TypeError, ValueError) as error:
+            msg = "target recalls must be finite values in (0, 1]"
+            raise ValueError(msg) from error
+        if not np.isfinite(value) or not 0.0 < value <= 1.0:
+            msg = "target recalls must be finite values in (0, 1]"
+            raise ValueError(msg)
+        recalls.append(value)
+    if recalls != sorted(recalls) or len(set(recalls)) != len(recalls):
+        msg = "target recalls must be strictly increasing and unique"
+        raise ValueError(msg)
+    return recalls
+
+
+def _validated_recall_frontier_arrays(
+    probabilities: np.ndarray,
+    detector_scores: np.ndarray,
+    targets: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Validate aligned five-class probabilities, detector scores and labels."""
+    probabilities = validate_probabilities(probabilities)
+    if probabilities.shape[1] != HALVING_N_CLASSES:
+        msg = f"halving probabilities must contain exactly {HALVING_N_CLASSES} classes"
+        raise ValueError(msg)
+
+    detector_scores = np.asarray(detector_scores)
+    if detector_scores.ndim != 1 or len(detector_scores) != len(probabilities):
+        msg = "detector_scores must be a vector matching probabilities"
+        raise ValueError(msg)
+    if not np.issubdtype(detector_scores.dtype, np.number) or np.iscomplexobj(detector_scores):
+        msg = "detector_scores must contain real numeric values"
+        raise ValueError(msg)
+    if not np.isfinite(detector_scores).all() or np.any((detector_scores < 0.0) | (detector_scores > 1.0)):
+        msg = "detector_scores must be finite and in [0, 1]"
+        raise ValueError(msg)
+
+    targets = _integer_vector(targets, "targets")
+    if len(targets) != len(probabilities):
+        msg = "targets must match probabilities"
+        raise ValueError(msg)
+    if targets.min() < 0 or targets.max() >= probabilities.shape[1]:
+        msg = f"targets must be between 0 and {HALVING_N_CLASSES - 1}"
+        raise ValueError(msg)
+    if not np.any(targets > 0):
+        msg = "at least one positive target is required"
+        raise ValueError(msg)
+    return probabilities, detector_scores, targets
+
+
+def recall_action_frontier(
+    probabilities: np.ndarray,
+    detector_scores: np.ndarray,
+    targets: np.ndarray,
+    target_recalls: tuple[float, ...] | list[float],
+) -> list[dict]:
+    """Evaluate exact-halving actions at a shared detector-recall grid.
+
+    Thresholds are fitted from the supplied labelled calibration split only
+    after the probabilistic checkpoint has been selected.  The helper reports
+    every requested operating point and deliberately does not select one.
+    This keeps recall out of training and checkpoint selection while allowing
+    sampling methods to be compared at identical detector coverage.
+    """
+    probabilities, detector_scores, targets = _validated_recall_frontier_arrays(
+        probabilities,
+        detector_scores,
+        targets,
+    )
+    recalls = _validated_recall_grid(target_recalls)
+
+    # Positive severity argmax is invariant across detector thresholds, so
+    # compute it once and only change the zero/non-zero gate along the grid.
+    positive_actions = probabilities[:, 1:].argmax(axis=1).astype(np.int64, copy=False) + 1
+    frontier = []
+    for target_recall in recalls:
+        threshold = threshold_at_recall(targets, detector_scores, target_recall)
+        detected = detector_scores >= threshold
+        actions = np.where(detected, positive_actions, 0)
+        metrics = halving_action_metrics(actions, targets, n_classes=probabilities.shape[1])
+        frontier.append(
+            {
+                "target_recall": target_recall,
+                "threshold": threshold,
+                "achieved_recall": metrics["detection_recall"],
+                "precision": metrics["detection_precision"],
+                "true_positive": metrics["true_positive"],
+                "false_positive": metrics["false_positive"],
+                "false_negative": metrics["false_negative"],
+                "true_negative": metrics["true_negative"],
+                "metrics": metrics,
+            }
+        )
+    return frontier
 
 
 def exact_halvings_metrics(outputs: np.ndarray, targets: np.ndarray, detected: np.ndarray) -> dict:
