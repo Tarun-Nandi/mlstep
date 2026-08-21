@@ -40,7 +40,7 @@ from mlstep.student import fp_recall_diagnostics, predict_joint_probabilities, s
 
 MANIFEST_VERSION: Final = "held-out-student-ensemble-v1"
 REPORT_VERSION: Final = "held-out-student-test-v1"
-ALLOWED_PREPROCESSING: Final = frozenset({"stretch32", "stretch128", "ple64"})
+ALLOWED_PREPROCESSING: Final = frozenset({"stretch32", "stretch128", "raw-stretch128", "ple64"})
 EXPECTED_DISCOVERED_TIMESTEPS: Final = tuple(range(2, 169))
 EXPECTED_TRAIN_TIMESTEPS: Final = tuple(range(2, 119))
 EXPECTED_VALIDATION_TIMESTEPS: Final = tuple(range(119, 144))

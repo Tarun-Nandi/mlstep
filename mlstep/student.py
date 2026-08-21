@@ -155,6 +155,7 @@ PREPROCESS_VARIANTS: Final = (
     "robust",
     "stretch32",
     "stretch128",
+    "raw-stretch128",
     "quantile",
     "ple64",
     "raw",

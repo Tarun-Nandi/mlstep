@@ -36,6 +36,7 @@ MISSING_TIMESTEP_PREVIEW = 8
 
 DEFAULT_OUTPUT_DIR: Final = Path(__file__).resolve().parent / "runs"
 DEFAULT_CACHE_DIR: Final = Path("/rds/user/rc-nand1/hpc-work/mlstep/cache")
+STRETCH_METHODS: Final = frozenset({"stretch32", "stretch128", "raw-stretch128"})
 
 
 def parse_timestep_range(value: str) -> tuple[int, ...]:
@@ -151,13 +152,17 @@ def _apply_preprocessing(
             raise ValueError(msg)
         return RobustPreprocesser.fit_transform(x, features, clip_threshold=3.0)
 
-    if method.startswith("stretch"):
+    if method in STRETCH_METHODS:
         if features is None:
             msg = "features required for stretch preprocessing"
             raise ValueError(msg)
-        # Extract n_bins from method name (e.g., "stretch32" -> 32)
-        n_bins = int(method.replace("stretch", ""))
-        return StretchPreprocesser.fit_transform(x, features, n_bins=n_bins)
+        n_bins = 128 if method == "raw-stretch128" else int(method.removeprefix("stretch"))
+        return StretchPreprocesser.fit_transform(
+            x,
+            features,
+            n_bins=n_bins,
+            apply_physical_transforms=method != "raw-stretch128",
+        )
 
     if method == "ple64":
         # PLE64 uses physical preprocessing for features
@@ -194,7 +199,8 @@ def _preprocess_features(
 ]:
     """Fit preprocessing on training data and transform both of the splits."""
     print(f"Preprocessing training ({preprocess_method})...")
-    features_arg = FEATURES if preprocess_method in ("physical", "robust", "stretch32", "stretch128", "ple64") else None
+    feature_methods = {"physical", "robust", "ple64", *STRETCH_METHODS}
+    features_arg = FEATURES if preprocess_method in feature_methods else None
     preprocessor, train_x_processed = _apply_preprocessing(
         train_x,
         preprocess_method,
@@ -205,7 +211,7 @@ def _preprocess_features(
         val_x_processed = preprocessor.transform(val_x, copy=False)
     elif preprocess_method == "quantile":
         val_x_processed = preprocessor.transform(val_x.astype(np.float32, copy=False))
-    elif preprocess_method == "robust" or preprocess_method.startswith("stretch"):
+    elif preprocess_method == "robust" or preprocess_method in STRETCH_METHODS:
         val_x_processed = preprocessor.transform(val_x, copy=False)
     else:
         val_x_processed = val_x
@@ -242,7 +248,7 @@ def _save_features_and_labels(
             n_quantiles_in=preprocessor.n_quantiles_,
             quantiles=preprocessor.quantiles_,
         )
-    elif preprocess_method == "robust" or preprocess_method.startswith("stretch"):
+    elif preprocess_method == "robust" or preprocess_method in STRETCH_METHODS:
         preprocessor_state = {
             **preprocessor.state(),
             "features": [{"name": f.name, "channels": f.channels, "transform": f.transform} for f in FEATURES],
@@ -577,19 +583,24 @@ def _preprocessing_metadata(
             "quantile_method": "linear",
             "clip_threshold": preprocessor.clip_threshold,
         }
-    if method.startswith("stretch") and isinstance(preprocessor, StretchPreprocesser):
-        return {
+    if method in STRETCH_METHODS and isinstance(preprocessor, StretchPreprocesser):
+        physical_prefix = (
+            "feature-specific log1p/arcsinh transforms, "
+            if preprocessor.apply_physical_transforms
+            else "raw inputs without feature-specific physical transforms, "
+        )
+        metadata = {
             **common,
-            "pipeline": (
-                "feature-specific log1p/arcsinh transforms, sampled train-quantile CDF stretch, "
-                "then train mean/std standardization"
-            ),
+            "pipeline": (f"{physical_prefix}sampled train-quantile CDF stretch, then train mean/std standardization"),
             "n_bins": preprocessor.n_bins,
             "quantile_fit_rows": preprocessor.fit_sample_rows,
             "quantile_fit_max_rows": int(preprocessor.state()["fit_sample_max_rows"][0]),
             "quantile_fit_seed": int(preprocessor.state()["fit_sample_seed"][0]),
             "quantile_method": "linear",
         }
+        if not preprocessor.apply_physical_transforms:
+            metadata["input_transform"] = "identity"
+        return metadata
     if method == "quantile" and isinstance(preprocessor, QuantileTransformer):
         return {
             **common,
@@ -786,11 +797,12 @@ def parse_args() -> argparse.Namespace:
         "--preprocess",
         type=str,
         default="physical",
-        choices=["physical", "quantile", "raw", "robust", "stretch32", "stretch128", "ple64"],
+        choices=["physical", "quantile", "raw", "robust", "stretch32", "stretch128", "raw-stretch128", "ple64"],
         help="Preprocessing method: physical (log/arcsinh+standardize),"
         " quantile (force N(0,1)), raw (no transform),"
         " robust (physical transforms + robust scale/smooth clip),"
-        " stretch32/128 (physical transforms + unsupervised CDF stretch)",
+        " stretch32/128 (physical transforms + unsupervised CDF stretch),"
+        " raw-stretch128 (raw inputs + unsupervised CDF stretch)",
     )
     return parser.parse_args()
 

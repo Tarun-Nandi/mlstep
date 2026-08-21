@@ -31,7 +31,7 @@ class Feature:
 
 
 # Available preprocessing methods for experiments
-PREPROCESSING_METHODS = ("standard", "robust", "stretch32", "stretch128", "ple64")
+PREPROCESSING_METHODS = ("standard", "robust", "stretch32", "stretch128", "raw-stretch128", "ple64")
 
 FEATURES = (
     Feature("temp", 1, "standard"),
@@ -290,22 +290,36 @@ class StretchPreprocesser:
     Divides each feature into quantile bins and applies a CDF-like stretch.
     """
 
-    scale: np.ndarray
+    scale: np.ndarray | None
     quantiles: np.ndarray  # Shape: (n_bins + 1, n_features)
     n_bins: int
     features: tuple[Feature, ...]
     mean: np.ndarray
     std: np.ndarray
     fit_sample_rows: int
+    apply_physical_transforms: bool = True
 
     @classmethod
-    def fit_transform(cls, x: np.ndarray, features, n_bins: int = 128) -> tuple["StretchPreprocesser", np.ndarray]:
-        """Fit train-only quantile bins, stretch, and standardize each column."""
+    def fit_transform(
+        cls,
+        x: np.ndarray,
+        features,
+        n_bins: int = 128,
+        *,
+        apply_physical_transforms: bool = True,
+    ) -> tuple["StretchPreprocesser", np.ndarray]:
+        """Fit train-only quantile bins, stretch, and standardize each column.
+
+        ``apply_physical_transforms=False`` fits directly in the raw feature
+        coordinates. This keeps the historical Stretch32/128 behaviour intact
+        while supporting a controlled raw-versus-physical preprocessing
+        ablation.
+        """
         if isinstance(n_bins, bool) or not isinstance(n_bins, int) or n_bins < MIN_STRETCH_BINS:
             msg = "n_bins must be an integer of at least two"
             raise ValueError(msg)
         x = np.asarray(x, dtype=np.float32, order="c")
-        scale = _physical_transform_fit_in_place(x, features)
+        scale = _physical_transform_fit_in_place(x, features) if apply_physical_transforms else None
 
         minimum, maximum = _column_extrema(x)
         fit_sample = _deterministic_quantile_sample(x)
@@ -340,12 +354,25 @@ class StretchPreprocesser:
             stretched_pos /= std[feat_idx]
             stretched[:, feat_idx] = stretched_pos
 
-        return cls(scale, quantiles, n_bins, features, mean, std, fit_sample_rows), stretched
+        return cls(
+            scale,
+            quantiles,
+            n_bins,
+            features,
+            mean,
+            std,
+            fit_sample_rows,
+            apply_physical_transforms,
+        ), stretched
 
     def transform(self, x: np.ndarray, *, copy: bool = True) -> np.ndarray:
         """Transform new data using learned quantiles."""
         out = np.array(x, dtype=np.float32, order="c", copy=copy)
-        transform_in_place(out, self.scale, self.features)
+        if self.apply_physical_transforms:
+            if self.scale is None:
+                msg = "physical Stretch preprocessing requires fitted feature scales"
+                raise RuntimeError(msg)
+            transform_in_place(out, self.scale, self.features)
 
         stretched = np.empty_like(out)
         n_features = out.shape[1]
@@ -360,8 +387,7 @@ class StretchPreprocesser:
 
     def state(self) -> dict[str, np.ndarray]:
         """Return learned quantile boundaries."""
-        return {
-            "scale": self.scale,
+        state = {
             "quantiles": self.quantiles,
             "n_bins": np.array([self.n_bins]),
             "mean": self.mean,
@@ -371,6 +397,14 @@ class StretchPreprocesser:
             "fit_sample_seed": np.array([QUANTILE_FIT_SEED]),
             "quantile_method": np.array("linear"),
         }
+        if self.apply_physical_transforms:
+            if self.scale is None:
+                msg = "physical Stretch preprocessing requires fitted feature scales"
+                raise RuntimeError(msg)
+            # Retain the historical state schema and insertion order for the
+            # existing physical Stretch32/128 methods.
+            return {"scale": self.scale, **state}
+        return {**state, "input_transform": np.array("identity")}
 
 
 FittedPreprocesser = Preprocesser | RobustPreprocesser | StretchPreprocesser
@@ -400,6 +434,20 @@ _STRETCH_STATE_KEYS = frozenset(
         "fit_sample_max_rows",
         "fit_sample_seed",
         "quantile_method",
+    }
+)
+_RAW_STRETCH_STATE_KEYS = frozenset(
+    {
+        "quantiles",
+        "n_bins",
+        "mean",
+        "std",
+        "features",
+        "fit_sample_rows",
+        "fit_sample_max_rows",
+        "fit_sample_seed",
+        "quantile_method",
+        "input_transform",
     }
 )
 
@@ -481,6 +529,48 @@ def _validate_quantile_fit_state(state: np.lib.npyio.NpzFile) -> int:
     return sample_rows
 
 
+def _load_stretch_preprocessor_state(
+    state: np.lib.npyio.NpzFile,
+    method: str,
+    features: tuple[Feature, ...],
+    scale: np.ndarray | None,
+    sample_rows: int,
+) -> StretchPreprocesser:
+    """Validate and reconstruct one physical or raw Stretch transform."""
+    n_features = sum(feature.channels for feature in features)
+    n_bins = _load_integer_state_scalar(state, "n_bins")
+    raw_coordinates = method == "raw-stretch128"
+    expected_n_bins = 128 if raw_coordinates else int(method.removeprefix("stretch"))
+    if n_bins != expected_n_bins or n_bins < MIN_STRETCH_BINS:
+        msg = f"preprocessor state n_bins={n_bins} is inconsistent with method {method!r}"
+        raise ValueError(msg)
+    if raw_coordinates:
+        input_transform = np.asarray(state["input_transform"])
+        if (
+            input_transform.shape != ()
+            or not np.issubdtype(input_transform.dtype, np.str_)
+            or str(input_transform) != "identity"
+        ):
+            msg = "raw Stretch preprocessor state must record the scalar input transform 'identity'"
+            raise ValueError(msg)
+    quantiles = _load_float_state_array(state, "quantiles", (n_bins + 1, n_features))
+    if np.any(np.diff(quantiles, axis=0) < 0.0):
+        msg = "preprocessor state quantiles must be nondecreasing in every feature"
+        raise ValueError(msg)
+    mean = _load_float_state_array(state, "mean", (n_features,))
+    std = _load_float_state_array(state, "std", (n_features,), positive=True)
+    return StretchPreprocesser(
+        scale,
+        quantiles,
+        n_bins,
+        features,
+        mean,
+        std,
+        sample_rows,
+        apply_physical_transforms=not raw_coordinates,
+    )
+
+
 def load_fitted_preprocessor(
     state_path: Path,
     method: str,
@@ -495,7 +585,7 @@ def load_fitted_preprocessor(
         Path to the ``preprocessor_state.npz`` artifact written by the cache builder.
     method
         The cache preprocessing method: ``physical``, ``ple64``, ``robust``,
-        ``stretch32`` or ``stretch128``.
+        ``stretch32``, ``stretch128`` or ``raw-stretch128``.
     features
         Expected ordered raw-feature specification. The saved specification must
         match exactly, preventing a transform from being applied to reordered data.
@@ -506,7 +596,7 @@ def load_fitted_preprocessor(
         A transform reconstructed solely from training-fitted state. Calling
         ``transform`` does not fit or update any statistics.
     """
-    supported_methods = {"physical", "ple64", "robust", "stretch32", "stretch128"}
+    supported_methods = {"physical", "ple64", "robust", "stretch32", "stretch128", "raw-stretch128"}
     if method not in supported_methods:
         msg = f"cannot load fitted preprocessing state for method {method!r}"
         raise ValueError(msg)
@@ -516,6 +606,8 @@ def load_fitted_preprocessor(
         expected_keys = _PHYSICAL_STATE_KEYS
         if method == "robust":
             expected_keys = _ROBUST_STATE_KEYS
+        elif method == "raw-stretch128":
+            expected_keys = _RAW_STRETCH_STATE_KEYS
         elif method.startswith("stretch"):
             expected_keys = _STRETCH_STATE_KEYS
         actual_keys = frozenset(state.files)
@@ -528,11 +620,16 @@ def load_fitted_preprocessor(
         feature_tuple = tuple(features)
         n_features = _validate_feature_state(state["features"], feature_tuple)
         vector_shape = (n_features,)
-        scale = _load_float_state_array(state, "scale", vector_shape, positive=True)
+        scale = None
+        if method != "raw-stretch128":
+            scale = _load_float_state_array(state, "scale", vector_shape, positive=True)
 
         if method in {"physical", "ple64"}:
             mean = _load_float_state_array(state, "mean", vector_shape)
             std = _load_float_state_array(state, "std", vector_shape, positive=True)
+            if scale is None:
+                msg = "physical preprocessing state is missing fitted feature scales"
+                raise RuntimeError(msg)
             return Preprocesser(scale, mean, std, feature_tuple)
 
         sample_rows = _validate_quantile_fit_state(state)
@@ -543,20 +640,12 @@ def load_fitted_preprocessor(
             if clip[0] < 0.0:
                 msg = "preprocessor state 'clip_threshold' must be non-negative"
                 raise ValueError(msg)
+            if scale is None:
+                msg = "robust preprocessing state is missing fitted feature scales"
+                raise RuntimeError(msg)
             return RobustPreprocesser(scale, median, iqr, float(clip[0]), feature_tuple, sample_rows)
 
-        n_bins = _load_integer_state_scalar(state, "n_bins")
-        expected_n_bins = int(method.removeprefix("stretch"))
-        if n_bins != expected_n_bins or n_bins < MIN_STRETCH_BINS:
-            msg = f"preprocessor state n_bins={n_bins} is inconsistent with method {method!r}"
-            raise ValueError(msg)
-        quantiles = _load_float_state_array(state, "quantiles", (n_bins + 1, n_features))
-        if np.any(np.diff(quantiles, axis=0) < 0.0):
-            msg = "preprocessor state quantiles must be nondecreasing in every feature"
-            raise ValueError(msg)
-        mean = _load_float_state_array(state, "mean", vector_shape)
-        std = _load_float_state_array(state, "std", vector_shape, positive=True)
-        return StretchPreprocesser(scale, quantiles, n_bins, feature_tuple, mean, std, sample_rows)
+        return _load_stretch_preprocessor_state(state, method, feature_tuple, scale, sample_rows)
 
 
 def chunks(x: np.ndarray):
