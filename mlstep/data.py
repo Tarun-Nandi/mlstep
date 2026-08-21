@@ -33,10 +33,9 @@ class Feature:
 # Available preprocessing methods for experiments
 PREPROCESSING_METHODS = ("standard", "robust", "stretch32", "stretch128", "raw-stretch128", "ple64")
 
-FEATURES = (
+BASELINE_FEATURES = (
     Feature("temp", 1, "standard"),
     Feature("pres", 1, "standard"),
-    # Feature("water_vapour", 1, "log1p"),
     Feature("cloud_frac", 1, "standard"),
     Feature("qcl", 1, "log1p"),
     Feature("cell_volume", 1, "standard"),
@@ -46,7 +45,110 @@ FEATURES = (
     Feature("photol_rates", 60, "log1p"),
     Feature("wetrt", 34, "log1p"),
 )
+
+# Candidate inputs for the corrected-residual feature experiment. The local
+# audit at t100 and t240 found that ``rk[6:66]`` exactly reproduced all 60
+# ``photol_rates`` channels, so this controlled treatment replaces the latter
+# instead of appending known duplicates from the inspected data. Water vapour
+# is also omitted because it was an effective constant multiple of tracer[16]
+# in both audited snapshots; dryrt remains deferred until its 42-channel and
+# vertical-mask semantics are known.
+QCF_FEATURE = Feature("qcf", 1, "log1p")
+SO4_SA_FEATURE = Feature("so4_sa", 1, "log1p")
+SZA_FEATURE = Feature("sza", 1, "standard")
+NLEV_WITH_DDEP_FEATURE = Feature("nlev_with_ddep", 1, "standard")
+AUXILIARY_FEATURES = (QCF_FEATURE, SO4_SA_FEATURE)
+REACTION_RATE_FEATURE = Feature("rk", 305, "log1p")
+REACTION_RATE_FEATURES = tuple(
+    REACTION_RATE_FEATURE if feature.name == "photol_rates" else feature for feature in BASELINE_FEATURES
+)
+
+# ``screen-superset`` is a storage schema, not a model treatment. Keeping the
+# baseline columns intact and appending every screened field lets one expensive
+# 15-day cache serve all six controlled feature views below. In particular,
+# ``rk`` is appended even though its audited channels 6:66 duplicate the
+# baseline photolysis block: the baseline view retains ``photol_rates`` while
+# the reaction-rate view selects ``rk`` in its place.
+SCREEN_SUPERSET_FEATURES = (
+    *BASELINE_FEATURES,
+    REACTION_RATE_FEATURE,
+    QCF_FEATURE,
+    SO4_SA_FEATURE,
+    SZA_FEATURE,
+    NLEV_WITH_DDEP_FEATURE,
+)
+SCREEN_FEATURE_VIEW_NAMES = (
+    "baseline",
+    "baseline-qcf",
+    "baseline-so4-sa",
+    "baseline-sza",
+    "baseline-nlev",
+    "rk",
+)
+FEATURE_SETS = {
+    "baseline": BASELINE_FEATURES,
+    "baseline-aux": (*BASELINE_FEATURES, *AUXILIARY_FEATURES),
+    "baseline-qcf": (*BASELINE_FEATURES, QCF_FEATURE),
+    "baseline-so4-sa": (*BASELINE_FEATURES, SO4_SA_FEATURE),
+    "baseline-sza": (*BASELINE_FEATURES, SZA_FEATURE),
+    "baseline-nlev": (*BASELINE_FEATURES, NLEV_WITH_DDEP_FEATURE),
+    "rk": REACTION_RATE_FEATURES,
+    "rk-aux": (*REACTION_RATE_FEATURES, *AUXILIARY_FEATURES),
+    "screen-superset": SCREEN_SUPERSET_FEATURES,
+}
+FEATURE_SET_NAMES = tuple(FEATURE_SETS)
+STRICT_NONNEGATIVE_FEATURES = frozenset({"qcf", "so4_sa", "rk", "sza", "nlev_with_ddep"})
+VERTICALLY_BROADCAST_FEATURES = frozenset({"sza", "nlev_with_ddep"})
+
+# Historical imports continue to mean the exact 266-column baseline schema.
+FEATURES = BASELINE_FEATURES
 FEATURE_GROUPS = tuple(feature.name for feature in FEATURES)
+
+
+def resolve_feature_set(name: str) -> tuple[Feature, ...]:
+    """Return one immutable, named feature schema for controlled experiments."""
+    try:
+        return FEATURE_SETS[name]
+    except KeyError as error:
+        options = ", ".join(FEATURE_SET_NAMES)
+        msg = f"unknown feature set {name!r}; expected one of: {options}"
+        raise ValueError(msg) from error
+
+
+def feature_view_indices(source_name: str, target_name: str) -> tuple[int, ...]:
+    """Return source-cache columns in the exact order required by a view.
+
+    The named screen views are deliberately projected from one wide cache so
+    that their labels, preprocessing fit and source rows are identical. Column
+    names rather than group positions define the projection; this also handles
+    the ``rk`` view, whose reaction-rate columns occur after ``wetrt`` in the
+    storage schema but replace ``photol_rates`` before ``wetrt`` in the model
+    schema.
+    """
+    source = resolve_feature_set(source_name)
+    target = resolve_feature_set(target_name)
+    if source_name == target_name:
+        return tuple(range(sum(feature.channels for feature in source)))
+    if source_name != "screen-superset" or target_name not in SCREEN_FEATURE_VIEW_NAMES:
+        msg = f"feature view {target_name!r} is not supported by source schema {source_name!r}"
+        raise ValueError(msg)
+
+    source_columns = feature_names(source)
+    target_columns = feature_names(target)
+    if len(source_columns) != len(set(source_columns)):
+        msg = f"source schema {source_name!r} contains ambiguous duplicate column names"
+        raise ValueError(msg)
+    source_index = {name: index for index, name in enumerate(source_columns)}
+    missing = [name for name in target_columns if name not in source_index]
+    if missing:
+        preview = ", ".join(missing[:5])
+        msg = f"target schema {target_name!r} is not a column subset of {source_name!r}: {preview}"
+        raise ValueError(msg)
+    indices = tuple(source_index[name] for name in target_columns)
+    if [source_columns[index] for index in indices] != target_columns:
+        msg = f"feature projection from {source_name!r} to {target_name!r} changed target column order"
+        raise RuntimeError(msg)
+    return indices
 
 
 @dataclass
@@ -338,8 +440,10 @@ class StretchPreprocesser:
         quantiles[-1] = maximum
         np.maximum.accumulate(quantiles, axis=0, out=quantiles)
 
-        # Apply stretch transformation
-        stretched = np.empty_like(x)
+        # Apply the stretch transformation in place. Quantiles and all fitted
+        # statistics are already detached from ``x``, so retaining a second
+        # complete matrix would only double peak memory. This is essential for
+        # the 511/513-column reaction-rate experiments.
         n_features = x.shape[1]
         mean = np.empty(n_features, dtype=np.float32)
         std = np.empty(n_features, dtype=np.float32)
@@ -352,7 +456,7 @@ class StretchPreprocesser:
                 std[feat_idx] = 1.0
             stretched_pos -= mean[feat_idx]
             stretched_pos /= std[feat_idx]
-            stretched[:, feat_idx] = stretched_pos
+            x[:, feat_idx] = stretched_pos
 
         return cls(
             scale,
@@ -363,7 +467,7 @@ class StretchPreprocesser:
             std,
             fit_sample_rows,
             apply_physical_transforms,
-        ), stretched
+        ), x
 
     def transform(self, x: np.ndarray, *, copy: bool = True) -> np.ndarray:
         """Transform new data using learned quantiles."""
@@ -374,16 +478,15 @@ class StretchPreprocesser:
                 raise RuntimeError(msg)
             transform_in_place(out, self.scale, self.features)
 
-        stretched = np.empty_like(out)
         n_features = out.shape[1]
 
         for feat_idx in range(n_features):
             stretched_pos = _stretch_column(out[:, feat_idx], self.quantiles[:, feat_idx], self.n_bins)
             stretched_pos -= self.mean[feat_idx]
             stretched_pos /= self.std[feat_idx]
-            stretched[:, feat_idx] = stretched_pos
+            out[:, feat_idx] = stretched_pos
 
-        return stretched
+        return out
 
     def state(self) -> dict[str, np.ndarray]:
         """Return learned quantile boundaries."""
@@ -667,6 +770,20 @@ def feature_names(features: tuple[Feature, ...]) -> list[str]:
     return names
 
 
+def feature_layout_metadata(features: tuple[Feature, ...]) -> dict[str, dict[str, object]]:
+    """Describe source-to-model layout changes for non-gridbox inputs."""
+    return {
+        feature.name: {
+            "source_dimensions": ["y", "x"],
+            "model_dimensions": ["z", "y", "x"],
+            "operation": "broadcast-over-z",
+            "vertical_levels": GRID_SHAPE[0],
+        }
+        for feature in features
+        if feature.name in VERTICALLY_BROADCAST_FEATURES
+    }
+
+
 def feature_group_names(features: tuple[Feature, ...]) -> list[str]:
     """Return the parent group for each column.
 
@@ -921,15 +1038,38 @@ def load_variable(data_dir: Path, name: str, timestep: int, channels: int = 1) -
     path = data_dir / f"{name}_{timestep}.nc"
     if not path.is_file():
         raise FileNotFoundError(path)
-    expected_dims = ("z", "y", "x") if channels == 1 else ("s", "z", "y", "x")
-    expected_shape = GRID_SHAPE if channels == 1 else (channels, *GRID_SHAPE)
+    broadcast_vertically = name in VERTICALLY_BROADCAST_FEATURES
+    if broadcast_vertically and channels != 1:
+        msg = f"vertically broadcast feature {name!r} must have exactly one source channel"
+        raise ValueError(msg)
+    if broadcast_vertically:
+        expected_dims = ("y", "x")
+        expected_shape = GRID_SHAPE[1:]
+    else:
+        expected_dims = ("z", "y", "x") if channels == 1 else ("s", "z", "y", "x")
+        expected_shape = GRID_SHAPE if channels == 1 else (channels, *GRID_SHAPE)
     with xr.open_dataset(path) as dataset:
         variable = dataset[name]
         variable = variable.transpose(*expected_dims)
         if variable.shape != expected_shape:
             msg = f"{path} has shape {variable.shape}; expected {expected_shape}"
             raise ValueError(msg)
-        return np.asarray(variable.values)
+        values = np.asarray(variable.values)
+    if name in STRICT_NONNEGATIVE_FEATURES:
+        minimum = np.min(values)
+        maximum = np.max(values)
+        if not np.isfinite(minimum) or not np.isfinite(maximum):
+            msg = f"{path} must contain only finite values"
+            raise ValueError(msg)
+        if minimum < 0:
+            msg = f"{path} must be non-negative for the feature-screen input contract"
+            raise ValueError(msg)
+    if broadcast_vertically:
+        # The model still emits one decision per (z, y, x) grid box. Broadcast
+        # column-level diagnostics lazily across z so loading does not allocate
+        # another dense three-dimensional source array.
+        values = np.broadcast_to(values, GRID_SHAPE)
+    return values
 
 
 def transform_in_place(

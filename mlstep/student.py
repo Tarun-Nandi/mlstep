@@ -19,7 +19,17 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mlstep.data import N_CLASSES, random_undersampling, training_index_pools
+from mlstep.data import (
+    FEATURES,
+    N_CLASSES,
+    Feature,
+    feature_layout_metadata,
+    feature_names,
+    feature_view_indices,
+    random_undersampling,
+    resolve_feature_set,
+    training_index_pools,
+)
 from mlstep.evaluation import (
     asymmetric_policy_frontier,
     detection_ap,
@@ -160,6 +170,16 @@ PREPROCESS_VARIANTS: Final = (
     "ple64",
     "raw",
 )
+FEATURE_VIEW_SOURCE_SET: Final = "screen-superset"
+FEATURE_VIEWS: Final = (
+    "baseline",
+    "baseline-qcf",
+    "baseline-so4-sa",
+    "baseline-sza",
+    "baseline-nlev",
+    "rk",
+)
+FEATURE_PROJECTION_VERSION: Final = "named-cache-column-projection-v1"
 
 FeatureMatrix = np.ndarray | torch.Tensor
 
@@ -171,6 +191,147 @@ def _sha256(path: Path) -> str:
         while block := handle.read(8 * 1024 * 1024):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _feature_schema(features: tuple[Feature, ...]) -> list[dict[str, str | int]]:
+    """Serialize an ordered feature-group contract for reports/checkpoints."""
+    return [
+        {
+            "name": feature.name,
+            "channels": feature.channels,
+            "transform": feature.transform,
+        }
+        for feature in features
+    ]
+
+
+def _cache_feature_provenance(metadata: dict, n_features: int) -> dict:
+    """Validate and normalize the cache's exact model-input schema.
+
+    Historical baseline caches predate named feature sets. They can be
+    identified unambiguously by their complete ordered 266-column name list;
+    arbitrary older/synthetic caches remain explicitly unnamed.
+    """
+    recorded_set = metadata.get("feature_set")
+    recorded_names = metadata.get("features")
+    baseline_names = feature_names(FEATURES)
+    if recorded_set is None and recorded_names == baseline_names and n_features == len(baseline_names):
+        recorded_set = "baseline"
+
+    if recorded_set is None:
+        return {
+            "feature_set": None,
+            "features": recorded_names,
+            "feature_groups": metadata.get("feature_groups"),
+            "feature_schema": metadata.get("feature_schema"),
+        }
+    if not isinstance(recorded_set, str):
+        msg = "Cache feature_set must be a string"
+        raise ValueError(msg)
+
+    features = resolve_feature_set(recorded_set)
+    expected_names = feature_names(features)
+    expected_groups = [feature.name for feature in features]
+    expected_schema = _feature_schema(features)
+    if len(expected_names) != n_features:
+        msg = "Cache feature-set width differs from its feature arrays"
+        raise ValueError(msg)
+    if recorded_names != expected_names:
+        msg = "Cache feature names differ from its named feature-set contract"
+        raise ValueError(msg)
+
+    # New named caches record both group-level forms. Legacy baseline caches
+    # did not, so synthesize those two fields only for that exact schema.
+    recorded_groups = metadata.get("feature_groups")
+    recorded_schema = metadata.get("feature_schema")
+    if recorded_groups is not None and recorded_groups != expected_groups:
+        msg = "Cache feature groups differ from its named feature-set contract"
+        raise ValueError(msg)
+    if recorded_schema is not None and recorded_schema != expected_schema:
+        msg = "Cache feature schema differs from its named feature-set contract"
+        raise ValueError(msg)
+    if metadata.get("feature_set") is not None and (recorded_groups is None or recorded_schema is None):
+        msg = "Named feature-set caches must record feature_groups and feature_schema"
+        raise ValueError(msg)
+
+    return {
+        "feature_set": recorded_set,
+        "features": expected_names,
+        "feature_groups": expected_groups,
+        "feature_schema": expected_schema,
+    }
+
+
+def _resolve_feature_projection(
+    metadata: dict,
+    source_n_features: int,
+    requested_view: str | None,
+) -> tuple[tuple[int, ...] | None, dict, dict | None, dict | None]:
+    """Validate an optional named projection from the screening superset.
+
+    Returns the selected source-column indices, selected model provenance,
+    source-cache provenance and projection contract. With no requested view,
+    the selected provenance is the cache provenance and the two optional
+    projection records are ``None`` for backward compatibility.
+    """
+    source_provenance = _cache_feature_provenance(metadata, source_n_features)
+    if requested_view is None:
+        return None, source_provenance, None, None
+    if requested_view not in FEATURE_VIEWS:
+        options = ", ".join(FEATURE_VIEWS)
+        msg = f"feature-view must be one of: {options}"
+        raise ValueError(msg)
+    if source_provenance["feature_set"] != FEATURE_VIEW_SOURCE_SET:
+        msg = f"--feature-view requires a {FEATURE_VIEW_SOURCE_SET!r} cache, not {source_provenance['feature_set']!r}"
+        raise ValueError(msg)
+
+    source_features = resolve_feature_set(FEATURE_VIEW_SOURCE_SET)
+    source_layouts = feature_layout_metadata(source_features)
+    if metadata.get("feature_layouts") != source_layouts:
+        msg = "Screen-superset cache feature layouts differ from the runtime broadcast contract"
+        raise ValueError(msg)
+
+    selected_features = resolve_feature_set(requested_view)
+    selected_names = feature_names(selected_features)
+    selected_layouts = feature_layout_metadata(selected_features)
+    source_indices = feature_view_indices(FEATURE_VIEW_SOURCE_SET, requested_view)
+    if len(source_indices) != len(selected_names):
+        msg = "Feature-view projection width differs from its named schema"
+        raise ValueError(msg)
+
+    expected_persisted_view = {
+        "source_indices": list(source_indices),
+        "features": selected_names,
+        "feature_schema": _feature_schema(selected_features),
+        "feature_layouts": selected_layouts,
+        "n_features": len(selected_names),
+    }
+    persisted_views = metadata.get("feature_views")
+    if not isinstance(persisted_views, dict):
+        msg = "Screen-superset cache is missing feature_views metadata"
+        raise ValueError(msg)
+    if persisted_views.get(requested_view) != expected_persisted_view:
+        msg = f"Cache metadata for feature view {requested_view!r} differs from the runtime contract"
+        raise ValueError(msg)
+
+    selected_provenance = {
+        "feature_set": requested_view,
+        "features": selected_names,
+        "feature_groups": [feature.name for feature in selected_features],
+        "feature_schema": _feature_schema(selected_features),
+        "feature_layouts": selected_layouts,
+    }
+    source_provenance = {**source_provenance, "feature_layouts": source_layouts}
+    projection = {
+        "version": FEATURE_PROJECTION_VERSION,
+        "source_feature_set": FEATURE_VIEW_SOURCE_SET,
+        "selected_feature_view": requested_view,
+        "source_n_features": source_n_features,
+        "selected_n_features": len(selected_names),
+        "source_column_indices": list(source_indices),
+        "selected_feature_layouts": selected_layouts,
+    }
+    return source_indices, selected_provenance, source_provenance, projection
 
 
 def _load_hard_negative_pool(
@@ -815,30 +976,58 @@ def _progress_interval(n_batches: int) -> int:
     return max(1, n_batches // PROGRESS_UPDATES_PER_PHASE)
 
 
-def _load_array_resident(path: Path) -> np.ndarray:
-    """Read an NPY array sequentially into RAM with visible progress.
+def _load_array_resident(
+    path: Path,
+    *,
+    columns: tuple[int, ...] | None = None,
+) -> np.ndarray:
+    """Read an NPY array or a column projection into RAM with progress.
 
     The old student kept the feature matrices as RDS-backed memory maps and
     then accessed shuffled rows. Copying sequentially once avoids repeated
-    remote page faults while keeping every cached value unchanged.
+    remote page faults while keeping every cached value unchanged. A named
+    feature view is copied directly into a right-sized destination; the full
+    screening matrix is never materialized in host RAM.
     """
     source = np.load(path, mmap_mode="r", allow_pickle=False)
+    selected_columns = None
+    if columns is not None:
+        if source.ndim != MATRIX_NDIM:
+            msg = "Column projection requires a two-dimensional NPY array"
+            raise ValueError(msg)
+        selected_columns = np.asarray(columns, dtype=np.int64)
+        if selected_columns.ndim != 1 or not len(selected_columns):
+            msg = "Column projection must contain at least one index"
+            raise ValueError(msg)
+        if len(np.unique(selected_columns)) != len(selected_columns):
+            msg = "Column projection indices must be unique"
+            raise ValueError(msg)
+        if np.any(selected_columns < 0) or np.any(selected_columns >= source.shape[1]):
+            msg = "Column projection contains an out-of-range index"
+            raise ValueError(msg)
     if source.ndim == 0:
         return np.asarray(source).copy()
 
-    destination = np.empty(source.shape, dtype=source.dtype)
-    bytes_per_row = max(1, source[0:1].nbytes)
+    destination_shape = source.shape if selected_columns is None else (source.shape[0], len(selected_columns))
+    destination = np.empty(destination_shape, dtype=source.dtype)
+    bytes_per_row = max(1, destination[0:1].nbytes)
     rows_per_chunk = max(1, LOAD_CHUNK_BYTES // bytes_per_row)
     n_chunks = int(np.ceil(len(source) / rows_per_chunk))
     progress_every = _progress_interval(n_chunks)
     started = time.perf_counter()
+    source_description = f"{source.nbytes / 2**30:.2f} GiB"
+    if selected_columns is not None:
+        source_description += f", projecting {len(selected_columns)}/{source.shape[1]} columns"
     print(
-        f"Loading {path.name}: {source.nbytes / 2**30:.2f} GiB in {n_chunks} sequential chunk(s)",
+        f"Loading {path.name}: {source_description} in {n_chunks} row-sequential chunk(s)",
         flush=True,
     )
     for chunk_number, start in enumerate(range(0, len(source), rows_per_chunk), start=1):
         stop = min(start + rows_per_chunk, len(source))
-        destination[start:stop] = source[start:stop]
+        if selected_columns is None:
+            destination[start:stop] = source[start:stop]
+        else:
+            destination[start:stop] = source[start:stop, selected_columns]
         if chunk_number % progress_every == 0 or chunk_number == n_chunks:
             elapsed = time.perf_counter() - started
             print(
@@ -846,6 +1035,15 @@ def _load_array_resident(path: Path) -> np.ndarray:
                 flush=True,
             )
     return destination
+
+
+def _npy_array_contract(path: Path) -> tuple[tuple[int, ...], np.dtype]:
+    """Inspect an NPY header through a read-only mmap without copying data."""
+    source = np.load(path, mmap_mode="r", allow_pickle=False)
+    shape = tuple(source.shape)
+    dtype = source.dtype
+    del source
+    return shape, dtype
 
 
 def _load_optional_teacher_pair(
@@ -1933,6 +2131,13 @@ def _validate_model_args(args: argparse.Namespace) -> None:
     if args.cache_residency == "cuda" and args.device != "cuda":
         msg = "--cache-residency cuda requires --device cuda"
         raise ValueError(msg)
+    feature_view = getattr(args, "feature_view", None)
+    if feature_view is not None and feature_view not in FEATURE_VIEWS:
+        msg = f"feature-view must be one of {FEATURE_VIEWS}"
+        raise ValueError(msg)
+    if feature_view is not None and args.preprocess == "ple64":
+        msg = "--feature-view is not compatible with source-indexed PLE metadata"
+        raise ValueError(msg)
     if not args.hidden or any(
         isinstance(width, bool) or not isinstance(width, int) or width < 1 for width in args.hidden
     ):
@@ -2107,6 +2312,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
     backward_compatible_defaults = {
         "cache_path": None,
         "cache_residency": DEFAULT_CACHE_RESIDENCY,
+        "feature_view": None,
         "lambda_sev": DEFAULT_LAMBDA_SEV,
         "lambda_ordinal": DEFAULT_LAMBDA_ORDINAL,
         "kd_temperature": DEFAULT_KD_TEMPERATURE,
@@ -2166,12 +2372,37 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
             metadata,
         )
 
+    train_source_shape, _ = _npy_array_contract(cache_dir / "train_x.npy")
+    val_source_shape, _ = _npy_array_contract(cache_dir / "val_x.npy")
+    if len(train_source_shape) != MATRIX_NDIM or len(val_source_shape) != MATRIX_NDIM:
+        msg = "Feature caches must be two-dimensional"
+        raise ValueError(msg)
+    if train_source_shape[1] != val_source_shape[1]:
+        msg = "Training and validation source caches have different feature counts"
+        raise ValueError(msg)
+    source_n_features = train_source_shape[1]
+    if metadata.get("n_features", source_n_features) != source_n_features:
+        msg = "Cache metadata feature count does not match the source feature arrays"
+        raise ValueError(msg)
+    (
+        selected_columns,
+        feature_provenance,
+        source_feature_provenance,
+        feature_projection,
+    ) = _resolve_feature_projection(metadata, source_n_features, args.feature_view)
+    if feature_projection is not None:
+        print(
+            f"Feature view {args.feature_view!r}: "
+            f"{feature_projection['selected_n_features']}/{source_n_features} cached columns",
+            flush=True,
+        )
+
     # Read each cache once in sequential chunks. Repeated random access to an
     # RDS-backed mmap was the dominant bottleneck for the week experiment.
     cache_load_start = time.perf_counter()
-    train_x_host = _load_array_resident(cache_dir / "train_x.npy")
+    train_x_host = _load_array_resident(cache_dir / "train_x.npy", columns=selected_columns)
     train_y = _load_array_resident(cache_dir / "train_y.npy")
-    val_x_host = _load_array_resident(cache_dir / "val_x.npy")
+    val_x_host = _load_array_resident(cache_dir / "val_x.npy", columns=selected_columns)
     val_y = _load_array_resident(cache_dir / "val_y.npy")
 
     print(f"Train: {train_x_host.shape}, {train_x_host.nbytes / 2**20:.1f} MiB (resident)")
@@ -2208,8 +2439,9 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         val_teacher_severity,
     )
 
-    if metadata.get("n_features", train_x_host.shape[1]) != train_x_host.shape[1]:
-        msg = "Cache metadata feature count does not match the feature arrays"
+    selected_feature_names = feature_provenance.get("features")
+    if selected_feature_names is not None and train_x_host.shape[1] != len(selected_feature_names):
+        msg = "Loaded model-input width differs from its selected feature schema"
         raise ValueError(msg)
     if isinstance(teacher_metadata, dict) and "delta_t" in teacher_metadata:
         print(f"Teacher delta_T: {float(teacher_metadata['delta_t']):.4f}")
@@ -2347,6 +2579,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         "architecture": model.architecture,
         "architecture_version": model.architecture_version,
         "n_features": train_x.shape[1],
+        **feature_provenance,
         "hidden": list(model.hidden_layers),
         "k": model.k,
         "dropout": model.dropout,
@@ -2361,6 +2594,13 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         "trainable_parameters": trainable_params,
         "cache_residency": cache_residency,
     }
+    if feature_projection is not None:
+        model_metadata.update(
+            {
+                "source_cache_features": source_feature_provenance,
+                "feature_projection": feature_projection,
+            }
+        )
     if epoch_sampler is None:
         negative_sampling_protocol = {
             "policy": "legacy-uniform-random-negative-v1",
@@ -2397,6 +2637,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
             "train_timesteps": metadata.get("train", {}).get("timesteps"),
             "validation_timesteps": metadata.get("val", {}).get("timesteps"),
         },
+        "input_features": feature_provenance,
         "negative_sampling": negative_sampling_protocol,
         "detector_bias_initialization": {
             "policy": DETECTOR_BIAS_POLICY,
@@ -2406,6 +2647,13 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
             "population_prevalence": population_prevalence,
         },
     }
+    if feature_projection is not None:
+        training_protocol.update(
+            {
+                "source_cache_features": source_feature_provenance,
+                "feature_projection": feature_projection,
+            }
+        )
     objective = {
         "version": "dual-head-response-kd-ordinal-v4",
         "distill": args.distill,
@@ -2794,6 +3042,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
     fp97_model_path = model_path.with_name(f"{model_path.stem}_fp97_best{model_path.suffix}")
     checkpoint_config = {
         **model_metadata,
+        "feature_view": args.feature_view,
         "delta_s": delta_s,
         "negative_sampling": args.negative_sampling,
         "hard_negative_fraction": (args.hard_negative_fraction if args.negative_sampling == "hard" else None),
@@ -3122,6 +3371,11 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_CACHE_RESIDENCY,
         choices=CACHE_RESIDENCIES,
         help="Keep resident feature matrices in host RAM, CUDA memory, or choose automatically",
+    )
+    parser.add_argument(
+        "--feature-view",
+        choices=FEATURE_VIEWS,
+        help=("Select a named model-input view from a screen-superset cache; omit to train on every cached column"),
     )
 
     # Architecture

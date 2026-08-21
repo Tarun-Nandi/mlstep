@@ -11,16 +11,21 @@ from sklearn.preprocessing import QuantileTransformer
 
 from mlstep.data import (
     DATA,
+    FEATURE_SET_NAMES,
     FEATURES,
     N_CLASSES,
+    SCREEN_FEATURE_VIEW_NAMES,
     Feature,
     Preprocesser,
     RobustPreprocesser,
     StretchPreprocesser,
     chunks,
     discover_timesteps,
+    feature_layout_metadata,
     feature_names,
+    feature_view_indices,
     load_timesteps,
+    resolve_feature_set,
     split_timesteps,
 )
 
@@ -33,6 +38,7 @@ PLE_IMPORTANCE_TYPE = "total_gain"
 MIN_PLE_BINS = 2
 TIMESTEP_RANGE_PARTS = 2
 MISSING_TIMESTEP_PREVIEW = 8
+MISSING_FEATURE_FILE_PREVIEW = 8
 
 DEFAULT_OUTPUT_DIR: Final = Path(__file__).resolve().parent / "runs"
 DEFAULT_CACHE_DIR: Final = Path("/rds/user/rc-nand1/hpc-work/mlstep/cache")
@@ -109,6 +115,25 @@ def _prepare_cache_directory(cache_dir: Path, teacher_path: Path | None) -> None
         raise FileExistsError(msg)
 
 
+def _validate_feature_files(
+    data_dir: Path,
+    timesteps: tuple[int, ...],
+    features: tuple[Feature, ...],
+) -> None:
+    """Fail before allocation when a requested feature file is unavailable."""
+    missing = [
+        data_dir / f"{feature.name}_{timestep}.nc"
+        for timestep in timesteps
+        for feature in features
+        if not (data_dir / f"{feature.name}_{timestep}.nc").is_file()
+    ]
+    if missing:
+        preview = ", ".join(path.name for path in missing[:MISSING_FEATURE_FILE_PREVIEW])
+        suffix = "..." if len(missing) > MISSING_FEATURE_FILE_PREVIEW else ""
+        msg = f"feature set is incomplete in {data_dir}: {preview}{suffix}"
+        raise FileNotFoundError(msg)
+
+
 def detector_margin(logits: np.ndarray, delta: float) -> np.ndarray:
     """Re-calibrate the probabilities of halving to counter the effect of undersampling negatives."""
     logsumexp_1to4 = np.logaddexp.reduce(logits[:, 1:5], axis=1)
@@ -180,27 +205,33 @@ def _apply_preprocessing(
 
 
 def _load_features(
-    data_dir: Path, train_steps: tuple[int, ...], val_steps: tuple[int, ...]
+    data_dir: Path,
+    train_steps: tuple[int, ...],
+    val_steps: tuple[int, ...],
+    features: tuple[Feature, ...],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Load the raw training and validation features."""
     print("\nLoading training data: ")
-    train_x, train_y = load_timesteps(data_dir, train_steps, FEATURES)
+    train_x, train_y = load_timesteps(data_dir, train_steps, features)
     print(f"Loaded train_x: {train_x.shape}, {train_x.nbytes // 2**20:.1f} MB")
     print("Loading validation data: ")
-    val_x, val_y = load_timesteps(data_dir, val_steps, FEATURES)
+    val_x, val_y = load_timesteps(data_dir, val_steps, features)
     print(f"Loaded val_x: {val_x.shape}, {val_x.nbytes // 2**20:.1f} MB")
     return train_x, train_y, val_x, val_y
 
 
 def _preprocess_features(
-    train_x: np.ndarray, val_x: np.ndarray, preprocess_method: str
+    train_x: np.ndarray,
+    val_x: np.ndarray,
+    preprocess_method: str,
+    features: tuple[Feature, ...],
 ) -> tuple[
     Preprocesser | QuantileTransformer | RobustPreprocesser | StretchPreprocesser | None, np.ndarray, np.ndarray
 ]:
     """Fit preprocessing on training data and transform both of the splits."""
     print(f"Preprocessing training ({preprocess_method})...")
     feature_methods = {"physical", "robust", "ple64", *STRETCH_METHODS}
-    features_arg = FEATURES if preprocess_method in feature_methods else None
+    features_arg = features if preprocess_method in feature_methods else None
     preprocessor, train_x_processed = _apply_preprocessing(
         train_x,
         preprocess_method,
@@ -227,6 +258,7 @@ def _save_features_and_labels(
     val_y: np.ndarray,
     preprocessor: Preprocesser | QuantileTransformer | RobustPreprocesser | StretchPreprocesser | None,
     preprocess_method: str,
+    features: tuple[Feature, ...],
     ple_metadata: dict | None = None,
 ) -> None:
     """Save features, labels, and preprocessor state."""
@@ -239,7 +271,7 @@ def _save_features_and_labels(
     if preprocess_method == "physical":
         preprocessor_state = {
             **preprocessor.state(),
-            "features": [{"name": f.name, "channels": f.channels, "transform": f.transform} for f in FEATURES],
+            "features": [{"name": f.name, "channels": f.channels, "transform": f.transform} for f in features],
         }
         np.savez(cache_dir / "preprocessor_state.npz", **preprocessor_state)
     elif preprocess_method == "quantile":
@@ -251,13 +283,13 @@ def _save_features_and_labels(
     elif preprocess_method == "robust" or preprocess_method in STRETCH_METHODS:
         preprocessor_state = {
             **preprocessor.state(),
-            "features": [{"name": f.name, "channels": f.channels, "transform": f.transform} for f in FEATURES],
+            "features": [{"name": f.name, "channels": f.channels, "transform": f.transform} for f in features],
         }
         np.savez(cache_dir / "preprocessor_state.npz", **preprocessor_state)
     elif preprocess_method == "ple64":
         preprocessor_state = {
             **preprocessor.state(),
-            "features": [{"name": f.name, "channels": f.channels, "transform": f.transform} for f in FEATURES],
+            "features": [{"name": f.name, "channels": f.channels, "transform": f.transform} for f in features],
         }
         np.savez(cache_dir / "preprocessor_state.npz", **preprocessor_state)
         # Save PLE-specific metadata
@@ -480,6 +512,8 @@ def _save_metadata(
     train_class_counts_used: list[int] | None,
     preprocess_method: str,
     preprocessor: Preprocesser | QuantileTransformer | RobustPreprocesser | StretchPreprocesser | None,
+    feature_set: str,
+    features: tuple[Feature, ...],
     ple_metadata: dict | None = None,
     *,
     data_dir: Path | None = None,
@@ -493,8 +527,14 @@ def _save_metadata(
         "cache_dir": str(cache_dir),
         "preprocess": preprocess_method,
         "preprocessing": _preprocessing_metadata(preprocess_method, preprocessor),
-        "features": feature_names(FEATURES),
-        "n_features": sum(f.channels for f in FEATURES),
+        "feature_set": feature_set,
+        "feature_groups": [feature.name for feature in features],
+        "feature_schema": [
+            {"name": feature.name, "channels": feature.channels, "transform": feature.transform} for feature in features
+        ],
+        "feature_layouts": feature_layout_metadata(features),
+        "features": feature_names(features),
+        "n_features": sum(feature.channels for feature in features),
         "train": {
             "shape": list(train_x.shape),
             "positives": int((train_y > 0).sum()),
@@ -515,6 +555,20 @@ def _save_metadata(
         },
         "teacher": None,
     }
+    if feature_set == "screen-superset":
+        metadata["feature_views"] = {
+            target_name: {
+                "source_indices": list(feature_view_indices(feature_set, target_name)),
+                "feature_schema": [
+                    {"name": feature.name, "channels": feature.channels, "transform": feature.transform}
+                    for feature in resolve_feature_set(target_name)
+                ],
+                "features": feature_names(resolve_feature_set(target_name)),
+                "feature_layouts": feature_layout_metadata(resolve_feature_set(target_name)),
+                "n_features": sum(feature.channels for feature in resolve_feature_set(target_name)),
+            }
+            for target_name in SCREEN_FEATURE_VIEW_NAMES
+        }
     if teacher_path is not None:
         if delta_t is None or train_class_counts is None or train_class_counts_used is None:
             msg = "complete teacher metadata is required when teacher_path is set"
@@ -615,11 +669,16 @@ def _preprocessing_metadata(
     raise TypeError(msg)
 
 
-def run(args: argparse.Namespace) -> None:
+def run(args: argparse.Namespace) -> None:  # noqa: PLR0915
     """Execute the caching pipeline."""
     teacher_path = getattr(args, "teacher_path", None)
+    feature_set = getattr(args, "feature_set", "baseline")
+    features = resolve_feature_set(feature_set)
     if args.preprocess == "ple64" and teacher_path is None:
         msg = "PLE64 cache generation requires --teacher-path for feature selection"
+        raise ValueError(msg)
+    if feature_set != "baseline" and teacher_path is not None:
+        msg = "teacher inference and PLE64 are only compatible with the baseline feature set"
         raise ValueError(msg)
 
     # Discover and split timesteps. Explicit ranges ensure the HPO cache never
@@ -632,18 +691,21 @@ def run(args: argparse.Namespace) -> None:
     )
     print(f"Train: t{train_steps[0]}-t{train_steps[-1]} ({len(train_steps)} steps)")
     print(f"Val: t{val_steps[0]}-t{val_steps[-1]} ({len(val_steps)} steps)")
+    print(f"Feature set: {feature_set} ({sum(feature.channels for feature in features)} columns)")
 
     # Resolve and validate the destination before allocating the raw matrices.
     # In particular, a teacherless rebuild must not silently retain targets
     # from an older teacherful cache at the same path.
     cache_dir = resolve_cache_path(args)
     _prepare_cache_directory(cache_dir, teacher_path)
+    _validate_feature_files(args.data_dir, (*train_steps, *val_steps), features)
 
     # Load the raw features
     train_x, train_y, val_x, val_y = _load_features(
         args.data_dir,
         train_steps,
         val_steps,
+        features,
     )
 
     teacher = None
@@ -663,6 +725,7 @@ def run(args: argparse.Namespace) -> None:
         train_x,
         val_x,
         args.preprocess,
+        features,
     )
 
     # PLE boundaries must use the exact coordinate system consumed by the
@@ -726,6 +789,7 @@ def run(args: argparse.Namespace) -> None:
         val_y,
         preprocessor,
         args.preprocess,
+        features,
         ple_metadata,
     )
 
@@ -742,6 +806,8 @@ def run(args: argparse.Namespace) -> None:
         train_cc_used,
         args.preprocess,
         preprocessor,
+        feature_set,
+        features,
         ple_metadata,
         data_dir=args.data_dir,
         discovered_steps=timesteps,
@@ -803,6 +869,15 @@ def parse_args() -> argparse.Namespace:
         " robust (physical transforms + robust scale/smooth clip),"
         " stretch32/128 (physical transforms + unsupervised CDF stretch),"
         " raw-stretch128 (raw inputs + unsupervised CDF stretch)",
+    )
+    parser.add_argument(
+        "--feature-set",
+        choices=FEATURE_SET_NAMES,
+        default="baseline",
+        help=(
+            "Named input schema. The screen-superset cache stores baseline, rk, qcf, so4_sa, sza and "
+            "nlev_with_ddep once so controlled model views can select their exact columns."
+        ),
     )
     return parser.parse_args()
 
