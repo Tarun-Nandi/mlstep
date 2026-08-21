@@ -178,6 +178,7 @@ FEATURE_VIEWS: Final = (
     "baseline-sza",
     "baseline-nlev",
     "rk",
+    "rk-qcf",
 )
 FEATURE_PROJECTION_VERSION: Final = "named-cache-column-projection-v1"
 
@@ -310,7 +311,13 @@ def _resolve_feature_projection(
     if not isinstance(persisted_views, dict):
         msg = "Screen-superset cache is missing feature_views metadata"
         raise ValueError(msg)
-    if persisted_views.get(requested_view) != expected_persisted_view:
+    persisted_view = persisted_views.get(requested_view)
+    # The original 575-column screen cache predates the confirmatory rk-qcf
+    # view but already contains every required column. Its complete ordered
+    # source schema is validated above, so this one new projection can be
+    # derived without rebuilding roughly 173 GiB of identical cached data.
+    derived_from_legacy_screen_cache = requested_view == "rk-qcf" and persisted_view is None
+    if not derived_from_legacy_screen_cache and persisted_view != expected_persisted_view:
         msg = f"Cache metadata for feature view {requested_view!r} differs from the runtime contract"
         raise ValueError(msg)
 

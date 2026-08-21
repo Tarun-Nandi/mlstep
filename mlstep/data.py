@@ -84,6 +84,7 @@ SCREEN_FEATURE_VIEW_NAMES = (
     "baseline-sza",
     "baseline-nlev",
     "rk",
+    "rk-qcf",
 )
 FEATURE_SETS = {
     "baseline": BASELINE_FEATURES,
@@ -93,6 +94,7 @@ FEATURE_SETS = {
     "baseline-sza": (*BASELINE_FEATURES, SZA_FEATURE),
     "baseline-nlev": (*BASELINE_FEATURES, NLEV_WITH_DDEP_FEATURE),
     "rk": REACTION_RATE_FEATURES,
+    "rk-qcf": (*REACTION_RATE_FEATURES, QCF_FEATURE),
     "rk-aux": (*REACTION_RATE_FEATURES, *AUXILIARY_FEATURES),
     "screen-superset": SCREEN_SUPERSET_FEATURES,
 }
