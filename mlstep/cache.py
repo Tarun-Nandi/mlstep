@@ -302,11 +302,100 @@ def _save_features_and_labels(
         np.savez(cache_dir / "preprocessor_state.npz", method=preprocess_method)
 
 
-def _load_teacher(teacher_path: Path) -> tuple[xgb.XGBClassifier, list[int], list[int], float]:
-    """Load teacher model and extract class counts for prior correction."""
+def _load_teacher(  # noqa: PLR0912, PLR0915
+    teacher_path: Path,
+    features: tuple[Feature, ...] = FEATURES,
+    train_steps: tuple[int, ...] = (),
+    validation_steps: tuple[int, ...] = (),
+) -> tuple[xgb.XGBClassifier, list[int], list[int], float, dict]:
+    """Load a teacher whose exact feature and chronological schema matches."""
+    teacher_json = Path(teacher_path).with_suffix(".json")
+    with open(teacher_json) as f:
+        teacher_meta = json.load(f)
+    teacher_config = teacher_meta.get("config", {})
+    expected_names = feature_names(features)
+    expected_groups = [feature.name for feature in features]
+    if teacher_config.get("feature_names") != expected_names:
+        msg = "Teacher feature names do not match the requested cache schema"
+        raise ValueError(msg)
+    if teacher_config.get("feature_groups") != expected_groups:
+        msg = "Teacher feature groups do not match the requested cache schema"
+        raise ValueError(msg)
+    if teacher_config.get("n_features") != len(expected_names):
+        msg = "Teacher feature count does not match the requested cache schema"
+        raise ValueError(msg)
+    if train_steps and teacher_config.get("train_steps") != list(train_steps):
+        msg = "Teacher training timesteps do not match the requested cache split"
+        raise ValueError(msg)
+    if validation_steps and teacher_config.get("validation_steps") != list(validation_steps):
+        msg = "Teacher validation timesteps do not match the requested cache split"
+        raise ValueError(msg)
+    if teacher_meta.get("task") != "multiclass" or teacher_config.get("multiclass") is not True:
+        msg = "PLE feature selection requires a multiclass teacher"
+        raise ValueError(msg)
+    if teacher_config.get("test_set_used") is not False:
+        msg = "Teacher report must confirm that the held-out test set was unused"
+        raise ValueError(msg)
+
+    teacher_data = teacher_meta.get("data", {})
+    count_fields = (
+        "train_class_counts",
+        "training_class_counts_used",
+        "validation_class_counts",
+    )
+    for field in count_fields:
+        counts = teacher_data.get(field)
+        if (
+            not isinstance(counts, list)
+            or len(counts) != N_CLASSES
+            or any(not isinstance(value, int) or value < 0 for value in counts)
+        ):
+            msg = f"Teacher report contains invalid {field}"
+            raise ValueError(msg)
+    train_class_counts = teacher_data["train_class_counts"]
+    train_class_counts_used = teacher_data["training_class_counts_used"]
+    if train_class_counts[0] <= 0 or train_class_counts_used[0] <= 0:
+        msg = "Teacher prior-correction counts must contain negative-class rows"
+        raise ValueError(msg)
+    if train_class_counts_used[0] > train_class_counts[0] or train_class_counts_used[1:] != train_class_counts[1:]:
+        msg = "Teacher sampling counts must downsample only the negative class"
+        raise ValueError(msg)
+    row_count_fields = (
+        ("train_rows", "train_class_counts"),
+        ("training_rows_used", "training_class_counts_used"),
+        ("validation_rows", "validation_class_counts"),
+    )
+    for row_field, count_field in row_count_fields:
+        rows = teacher_data.get(row_field)
+        if not isinstance(rows, int) or rows != sum(teacher_data[count_field]):
+            msg = f"Teacher report contains inconsistent {row_field}"
+            raise ValueError(msg)
+
     print(f"\nLoading teacher from {teacher_path}...")
     teacher = xgb.XGBClassifier()
     teacher.load_model(str(teacher_path))
+    booster = teacher.get_booster()
+    if booster.num_features() != len(expected_names):
+        msg = "Teacher model input width does not match the requested cache schema"
+        raise ValueError(msg)
+    raw_model_metadata = booster.attr("mlstep_metadata")
+    if raw_model_metadata is None:
+        msg = "Teacher model lacks embedded mlstep schema metadata"
+        raise ValueError(msg)
+    try:
+        model_metadata = json.loads(raw_model_metadata)
+    except json.JSONDecodeError as error:
+        msg = "Teacher model contains invalid embedded mlstep metadata"
+        raise ValueError(msg) from error
+    if model_metadata.get("task") != "multiclass":
+        msg = "Teacher model is not a multiclass model"
+        raise ValueError(msg)
+    if model_metadata.get("feature_names") != expected_names:
+        msg = "Teacher model feature names do not match the requested cache schema"
+        raise ValueError(msg)
+    if model_metadata.get("feature_groups") != expected_groups:
+        msg = "Teacher model feature groups do not match the requested cache schema"
+        raise ValueError(msg)
     teacher.set_params(
         tree_method="hist",
         learning_rate=0.05,
@@ -318,16 +407,10 @@ def _load_teacher(teacher_path: Path) -> tuple[xgb.XGBClassifier, list[int], lis
         max_bin=128,
     )
 
-    teacher_json = Path(teacher_path).with_suffix(".json")
-    with open(teacher_json) as f:
-        teacher_meta = json.load(f)
-    train_class_counts = teacher_meta["data"]["train_class_counts"]
-    train_class_counts_used = teacher_meta["data"]["training_class_counts_used"]
-
     delta_t = np.log(train_class_counts[0] / train_class_counts_used[0])
     print(f"Teacher delta_T = log({train_class_counts[0]} / {train_class_counts_used[0]}) = {delta_t:.4f}")
 
-    return teacher, train_class_counts, train_class_counts_used, delta_t
+    return teacher, train_class_counts, train_class_counts_used, delta_t, teacher_meta
 
 
 def _stratified_sample_indices(n_rows: int, max_rows: int, seed: int = 0) -> np.ndarray:
@@ -410,11 +493,15 @@ def _compute_ple_bin_boundaries(
     return boundaries, len(sample_indices)
 
 
-def _teacher_total_gain(teacher: xgb.XGBClassifier, n_features: int) -> np.ndarray:
+def _teacher_total_gain(
+    teacher: xgb.XGBClassifier,
+    n_features: int,
+    features: tuple[Feature, ...] = FEATURES,
+) -> np.ndarray:
     """Return an explicit dense XGBoost total-gain vector."""
     scores = np.zeros(n_features, dtype=np.float64)
     raw_scores = teacher.get_booster().get_score(importance_type=PLE_IMPORTANCE_TYPE)
-    names = feature_names(FEATURES)
+    names = feature_names(features)
     name_to_index = {name: index for index, name in enumerate(names)}
     unrecognized = []
     for key, value in raw_scores.items():
@@ -436,6 +523,7 @@ def _select_top_features(
     teacher: xgb.XGBClassifier,
     x: np.ndarray,
     n_top: int,
+    features: tuple[Feature, ...] = FEATURES,
 ) -> tuple[list[int], np.ndarray, list[int]]:
     """Select top continuous features by XGBoost importance.
 
@@ -451,7 +539,7 @@ def _select_top_features(
     if n_top < 1:
         msg = "n_top must be positive"
         raise ValueError(msg)
-    names = feature_names(FEATURES)
+    names = feature_names(features)
     if len(names) != x.shape[1]:
         msg = "feature metadata does not match the training matrix"
         raise ValueError(msg)
@@ -466,7 +554,7 @@ def _select_top_features(
         msg = f"Only {len(eligible)} eligible continuous features are available for PLE; requested {n_top}"
         raise ValueError(msg)
 
-    importance = _teacher_total_gain(teacher, x.shape[1])
+    importance = _teacher_total_gain(teacher, x.shape[1], features)
     selected = sorted(eligible, key=lambda index: (-importance[index], index))[:n_top]
     return selected, importance[selected].astype(np.float32), excluded
 
@@ -677,10 +765,6 @@ def run(args: argparse.Namespace) -> None:  # noqa: PLR0915
     if args.preprocess == "ple64" and teacher_path is None:
         msg = "PLE64 cache generation requires --teacher-path for feature selection"
         raise ValueError(msg)
-    if feature_set != "baseline" and teacher_path is not None:
-        msg = "teacher inference and PLE64 are only compatible with the baseline feature set"
-        raise ValueError(msg)
-
     # Discover and split timesteps. Explicit ranges ensure the HPO cache never
     # reads the later locked-test period.
     timesteps = discover_timesteps(args.data_dir)
@@ -700,6 +784,21 @@ def run(args: argparse.Namespace) -> None:  # noqa: PLR0915
     _prepare_cache_directory(cache_dir, teacher_path)
     _validate_feature_files(args.data_dir, (*train_steps, *val_steps), features)
 
+    # Validate the complete report and embedded model schema before allocating
+    # the roughly 80 GiB direct-cache matrices.
+    teacher = None
+    teacher_report = None
+    train_cc = None
+    train_cc_used = None
+    delta_t = None
+    if teacher_path is not None:
+        teacher, train_cc, train_cc_used, delta_t, teacher_report = _load_teacher(
+            teacher_path,
+            features,
+            train_steps,
+            val_steps,
+        )
+
     # Load the raw features
     train_x, train_y, val_x, val_y = _load_features(
         args.data_dir,
@@ -708,14 +807,19 @@ def run(args: argparse.Namespace) -> None:  # noqa: PLR0915
         features,
     )
 
-    teacher = None
-    train_cc = None
-    train_cc_used = None
-    delta_t = None
     if teacher_path is not None:
         # Teacher targets remain available for the existing distillation and
         # PLE workflows, but a supervised Stretch128 cache does not need them.
-        teacher, train_cc, train_cc_used, delta_t = _load_teacher(teacher_path)
+        if teacher is None or teacher_report is None:
+            msg = "Teacher preflight unexpectedly produced no model or report"
+            raise RuntimeError(msg)
+        teacher_data = teacher_report["data"]
+        if teacher_data["train_class_counts"] != np.bincount(train_y, minlength=N_CLASSES).tolist():
+            msg = "Teacher training class counts do not match the cache source data"
+            raise ValueError(msg)
+        if teacher_data["validation_class_counts"] != np.bincount(val_y, minlength=N_CLASSES).tolist():
+            msg = "Teacher validation class counts do not match the cache source data"
+            raise ValueError(msg)
         _compute_and_save_teacher_targets(cache_dir, teacher, train_x, val_x, delta_t)
     else:
         print("No teacher supplied; writing a supervised-only cache.")
@@ -741,6 +845,7 @@ def run(args: argparse.Namespace) -> None:  # noqa: PLR0915
             teacher,
             train_x_processed,
             PLE64_N_FEATURES,
+            features,
         )
         selected = set(ple_indices)
         bypass_indices = [index for index in range(train_x_processed.shape[1]) if index not in selected]

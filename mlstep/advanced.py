@@ -1,53 +1,59 @@
 """Advanced training utilities for Phase 3 experiments."""
 
+import math
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+MATRIX_NDIM = 2
+MIN_CONTRASTIVE_ROWS = 2
 
-class ContrastivePretrainer(nn.Module):
-    """Contrastive pre-training for tabular data."""
 
-    def __init__(self, n_features: int, hidden_dim: int = 256, projection_dim: int = 128, temperature: float = 0.5):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(n_features, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, projection_dim)
-        )
-        self.temperature = temperature
+def supervised_contrastive_loss(projections: Tensor, labels: Tensor, temperature: float) -> Tensor:
+    """Return the stable supervised contrastive loss for one batch."""
+    if projections.ndim != MATRIX_NDIM:
+        msg = "contrastive projections must be a two-dimensional matrix"
+        raise ValueError(msg)
+    labels = labels.reshape(-1)
+    if labels.shape[0] != projections.shape[0]:
+        msg = "contrastive labels must contain one value per projection"
+        raise ValueError(msg)
+    if labels.device != projections.device:
+        msg = "contrastive labels and projections must be on the same device"
+        raise ValueError(msg)
+    if projections.shape[0] < MIN_CONTRASTIVE_ROWS:
+        msg = "contrastive batches must contain at least two rows"
+        raise ValueError(msg)
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        msg = "contrastive temperature must be finite and positive"
+        raise ValueError(msg)
 
-    def forward(self, x: Tensor, labels: Tensor) -> tuple[Tensor, Tensor]:
-        """Forward pass with contrastive loss."""
-        projections = self.encoder(x)
-        # Normalize projections
-        projections = F.normalize(projections, dim=1)
+    normalized = F.normalize(projections, dim=1)
+    logits = normalized @ normalized.t() / temperature
+    logits = logits - logits.max(dim=1, keepdim=True).values.detach()
 
-        # Compute contrastive loss
-        batch_size = x.shape[0]
-        labels = labels.view(-1, 1)
+    diagonal = torch.eye(len(labels), dtype=torch.bool, device=labels.device)
+    candidate_mask = ~diagonal
+    positive_mask = labels[:, None].eq(labels[None, :]) & candidate_mask
+    valid_anchors = positive_mask.any(dim=1)
+    if not bool(valid_anchors.all()):
+        msg = "every contrastive row must have a same-class partner"
+        raise ValueError(msg)
 
-        # Create positive mask (same class)
-        mask = (labels == labels.t()).float()
-
-        # Compute similarity matrix
-        sim_matrix = torch.mm(projections, projections.t()) / self.temperature
-
-        # Remove diagonal (self-similarity)
-        sim_matrix.fill_diagonal_(float("-inf"))
-
-        # Contrastive loss
-        exp_sim = torch.exp(sim_matrix)
-        sum_exp = exp_sim.sum(dim=1, keepdim=True)
-
-        # Positive pairs
-        pos_mask = mask - torch.eye(batch_size, device=x.device)
-        pos_sim = (sim_matrix * pos_mask).sum(dim=1) / (pos_mask.sum(dim=1) + 1e-8)
-
-        loss = -torch.log(torch.exp(pos_sim) / (sum_exp.squeeze() + 1e-8))
-        loss = loss.mean()
-
-        return projections, loss
+    log_denominator = torch.logsumexp(logits.masked_fill(~candidate_mask, float("-inf")), dim=1)
+    log_probabilities = logits - log_denominator[:, None]
+    positive_counts = positive_mask.sum(dim=1).clamp_min(1)
+    positive_log_probability = (
+        torch.where(
+            positive_mask,
+            log_probabilities,
+            torch.zeros_like(log_probabilities),
+        ).sum(dim=1)
+        / positive_counts
+    )
+    return -positive_log_probability[valid_anchors].mean()
 
 
 class LabelSmoothingCrossEntropy(nn.Module):

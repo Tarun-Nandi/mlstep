@@ -19,6 +19,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from mlstep.advanced import supervised_contrastive_loss
 from mlstep.data import (
     FEATURES,
     N_CLASSES,
@@ -102,6 +103,14 @@ DEFAULT_LAMBDA_ORDINAL: Final = 0.0
 DEFAULT_ALPHA: Final = 1.0
 DEFAULT_BETA: Final = 0.1
 DEFAULT_KD_TEMPERATURE: Final = 1.0
+DEFAULT_CONTRASTIVE_PRETRAIN_EPOCHS: Final = 0
+DEFAULT_CONTRASTIVE_TEMPERATURE: Final = 0.5
+DEFAULT_CONTRASTIVE_PROJECTION_DIM: Final = 128
+DEFAULT_LABEL_SMOOTHING: Final = 0.0
+DEFAULT_PREDICTION_TEMPERATURE: Final = 1.0
+CONTRASTIVE_SEED_OFFSET: Final = 7_000_000
+MIN_CONTRASTIVE_ROWS_PER_CLASS: Final = 2
+MIN_CONTRASTIVE_BATCH_SIZE: Final = 6
 GPU_DATA_RESERVE_BYTES: Final = 16 * 2**30
 LOAD_CHUNK_BYTES: Final = 512 * 2**20
 PROGRESS_UPDATES_PER_PHASE: Final = 10
@@ -539,6 +548,7 @@ class Student(nn.Module):
         dropout: float = DROPOUT,
         architecture: str = DEFAULT_ARCHITECTURE,
         ple_config: dict | None = None,
+        prediction_temperature: float = DEFAULT_PREDICTION_TEMPERATURE,
     ) -> None:
         """Initialize the student model.
 
@@ -548,6 +558,8 @@ class Student(nn.Module):
             k: Number of ensemble members (1 for MLP, 2+ for TabM-mini)
             dropout: Dropout rate
             architecture: 'mlp' or 'tabm-mini'
+            prediction_temperature: Fixed temperature applied to detector and
+                conditional-severity logits when producing probabilities
             ple_config: Optional PLE configuration dict with keys:
                 - 'n_ple_features': Number of features to apply PLE to (e.g., 64)
                 - 'n_bins': Number of quantile bins (default: 48)
@@ -569,6 +581,9 @@ class Student(nn.Module):
         if architecture == "tabm-mini" and k < MIN_TABM_MEMBERS:
             msg = "TabM-mini requires at least two ensemble members"
             raise ValueError(msg)
+        if not np.isfinite(prediction_temperature) or prediction_temperature <= 0.0:
+            msg = "prediction_temperature must be finite and positive"
+            raise ValueError(msg)
 
         hidden_layers = list(HIDDEN_LAYERS if hidden_layers is None else hidden_layers)
         if not hidden_layers:
@@ -581,6 +596,7 @@ class Student(nn.Module):
         self.n_features = n_features
         self.hidden_layers = tuple(hidden_layers)
         self.dropout = dropout
+        self.prediction_temperature = float(prediction_temperature)
         self.ple_config = _normalized_ple_config(n_features, ple_config)
 
         # Initialize PLE layer if config provided
@@ -635,12 +651,8 @@ class Student(nn.Module):
             self.detector_head = LinearEnsemble(hidden_layers[-1], 1, k=k)
             self.severity_head = LinearEnsemble(hidden_layers[-1], N_SEVERITY_CLASSES, k=k)
 
-    def forward_logits(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return member logits without computing unused training probabilities.
-
-        If PLE is enabled, input should have raw features (n_features) and will
-        be expanded internally to ple_output_dim before the backbone.
-        """
+    def representations(self, x: torch.Tensor) -> torch.Tensor:
+        """Return member representations with shape ``(batch, members, hidden)``."""
         if x.ndim != MATRIX_NDIM:
             msg = f"Input must be 2D, got shape {tuple(x.shape)}"
             raise ValueError(msg)
@@ -664,15 +676,22 @@ class Student(nn.Module):
             x = torch.cat([ple_embedded, x_bypass], dim=1)
 
         if self.architecture == "mlp":
-            representation = self.backbone(x)
-            d_logit = self.detector_head(representation).squeeze(-1).unsqueeze(0)
-            s_logits = self.severity_head(representation).unsqueeze(0)
+            return self.backbone(x).unsqueeze(1)
+
+        # A copy-free view becomes K distinct representations through
+        # trainable scaling before any features are mixed.
+        member_inputs = x.unsqueeze(1).expand(-1, self.k, -1)
+        member_inputs = self.input_scaling(member_inputs)
+        return self.backbone(member_inputs)
+
+    def forward_logits(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return member logits without computing unused training probabilities."""
+        representation = self.representations(x)
+        if self.architecture == "mlp":
+            single_representation = representation[:, 0]
+            d_logit = self.detector_head(single_representation).squeeze(-1).unsqueeze(0)
+            s_logits = self.severity_head(single_representation).unsqueeze(0)
         else:
-            # A copy-free view becomes K distinct representations through
-            # trainable scaling before any features are mixed.
-            member_inputs = x.unsqueeze(1).expand(-1, self.k, -1)
-            member_inputs = self.input_scaling(member_inputs)
-            representation = self.backbone(member_inputs)
             d_logit = self.detector_head(representation).squeeze(-1).transpose(0, 1)
             s_logits = self.severity_head(representation).transpose(0, 1)
 
@@ -682,8 +701,7 @@ class Student(nn.Module):
         """Run the model and combine ensemble probabilities."""
         d_logit, s_logits = self.forward_logits(x)
 
-        detector_probability = torch.sigmoid(d_logit)
-        severity_probability = torch.softmax(s_logits, dim=-1)
+        detector_probability, severity_probability = self.member_probabilities(d_logit, s_logits)
 
         # Average each member's joint distribution, rather than multiplying
         # independently averaged detector and severity probabilities.
@@ -692,6 +710,18 @@ class Student(nn.Module):
         denominator = d.unsqueeze(-1).clamp_min(torch.finfo(d.dtype).tiny)
         s = positive_mass / denominator
         return d_logit, d, s_logits, s
+
+    def member_probabilities(
+        self,
+        detector_logits: torch.Tensor,
+        severity_logits: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Convert member logits to probabilities with fixed output scaling."""
+        temperature = self.prediction_temperature
+        return (
+            torch.sigmoid(detector_logits / temperature),
+            torch.softmax(severity_logits / temperature, dim=-1),
+        )
 
     def joint_distribution(self, d: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
         """Construct full 5-class distribution from detection and severity."""
@@ -777,6 +807,7 @@ def student_from_checkpoint(checkpoint: dict) -> Student:
         dropout=config["dropout"],
         architecture=architecture,
         ple_config=config.get("ple_config"),
+        prediction_temperature=config.get("prediction_temperature", DEFAULT_PREDICTION_TEMPERATURE),
     )
     model.load_state_dict(state_dict, strict=True)
     return model
@@ -797,6 +828,7 @@ def compute_loss(  # noqa: PLR0912, PLR0915
     return_breakdown: bool = False,
     detector_weights: torch.Tensor | None = None,
     lambda_ordinal: float = DEFAULT_LAMBDA_ORDINAL,
+    label_smoothing: float = DEFAULT_LABEL_SMOOTHING,
 ) -> torch.Tensor | tuple[torch.Tensor, LossBreakdown]:
     """Compute hard-label and optional response-distillation losses.
 
@@ -811,12 +843,17 @@ def compute_loss(  # noqa: PLR0912, PLR0915
     if not np.isfinite(lambda_ordinal) or lambda_ordinal < 0.0:
         msg = "lambda_ordinal must be finite and non-negative"
         raise ValueError(msg)
+    if not np.isfinite(label_smoothing) or not 0.0 <= label_smoothing < 1.0:
+        msg = "label_smoothing must be finite and in [0, 1)"
+        raise ValueError(msg)
     if (teacher_margin is None) != (teacher_severity is None):
         msg = "Teacher margin and severity targets must either both be present or both absent"
         raise ValueError(msg)
 
     # Detector ground truth
     binary_target = (labels > 0).to(d_logit.dtype)
+    if label_smoothing:
+        binary_target = binary_target * (1.0 - label_smoothing) + label_smoothing / 2.0
     binary_target = binary_target.unsqueeze(0).expand_as(d_logit)
     # d_logit represents the population margin. Negative undersampling makes
     # the sampled-data log odds larger by delta_s, so this shift is used only
@@ -869,6 +906,7 @@ def compute_loss(  # noqa: PLR0912, PLR0915
         severity_loss = F.cross_entropy(
             positive_logits.reshape(-1, positive_logits.shape[-1]),
             severity_target.reshape(-1),
+            label_smoothing=label_smoothing,
         )
         if lambda_ordinal:
             severity_ordinal_loss = conditional_severity_rps_loss(
@@ -1273,6 +1311,7 @@ def train_epoch(
     lambda_sev: float = DEFAULT_LAMBDA_SEV,
     kd_temperature: float = DEFAULT_KD_TEMPERATURE,
     lambda_ordinal: float = DEFAULT_LAMBDA_ORDINAL,
+    label_smoothing: float = DEFAULT_LABEL_SMOOTHING,
     epoch_sampler: CyclicUniformNegativeSampler | StratifiedHardNegativeSampler | None = None,
     epoch: int | None = None,
 ) -> float | TrainEpochResult:
@@ -1341,6 +1380,7 @@ def train_epoch(
             return_breakdown=True,
             detector_weights=batch_detector_weights,
             lambda_ordinal=lambda_ordinal,
+            label_smoothing=label_smoothing,
         )
         if not isinstance(loss_result, tuple):
             msg = "Loss breakdown was requested but not returned"
@@ -1383,6 +1423,201 @@ def train_epoch(
         sampling_metadata=prepared.sampling_metadata,
     )
     return result if return_details else result.loss
+
+
+def balanced_contrastive_batches(
+    positive_indices: np.ndarray,
+    negative_indices: np.ndarray,
+    batch_size: int,
+    seed: int,
+) -> tuple[np.ndarray, ...]:
+    """Build deterministic one-to-one binary batches using every positive row."""
+    if batch_size < MIN_CONTRASTIVE_BATCH_SIZE or batch_size % 2:
+        msg = "contrastive pretraining requires an even batch size of at least six"
+        raise ValueError(msg)
+    if len(positive_indices) < MIN_CONTRASTIVE_ROWS_PER_CLASS:
+        msg = "contrastive pretraining requires at least two positive rows"
+        raise ValueError(msg)
+    if len(negative_indices) < len(positive_indices):
+        msg = "contrastive pretraining requires at least as many negatives as positives"
+        raise ValueError(msg)
+
+    rng = np.random.default_rng(seed)
+    positives = rng.permutation(np.asarray(positive_indices, dtype=np.int64))
+    negatives = rng.choice(
+        np.asarray(negative_indices, dtype=np.int64),
+        size=len(positives),
+        replace=False,
+    )
+    rows_per_class = batch_size // 2
+    chunk_sizes = [rows_per_class] * (len(positives) // rows_per_class)
+    remainder = len(positives) % rows_per_class
+    if remainder == 1 and chunk_sizes:
+        if rows_per_class == MIN_CONTRASTIVE_ROWS_PER_CLASS:
+            chunk_sizes[-1] += 1
+        else:
+            chunk_sizes[-1] -= 1
+            chunk_sizes.append(MIN_CONTRASTIVE_ROWS_PER_CLASS)
+    elif remainder:
+        chunk_sizes.append(remainder)
+
+    batches = []
+    offset = 0
+    for chunk_size in chunk_sizes:
+        if chunk_size < MIN_CONTRASTIVE_ROWS_PER_CLASS:
+            continue
+        batch = np.concatenate(
+            (
+                positives[offset : offset + chunk_size],
+                negatives[offset : offset + chunk_size],
+            )
+        )
+        batches.append(rng.permutation(batch))
+        offset += chunk_size
+    if offset != len(positives):
+        msg = "contrastive batch construction did not consume every positive row"
+        raise RuntimeError(msg)
+    return tuple(batches)
+
+
+def _contrastive_feature_batch(
+    features: FeatureMatrix,
+    indices: np.ndarray,
+    device: torch.device,
+) -> torch.Tensor:
+    """Gather one contrastive feature batch from host or resident CUDA data."""
+    if isinstance(features, torch.Tensor):
+        index_tensor = torch.as_tensor(indices, dtype=torch.long, device=features.device)
+        return features.index_select(0, index_tensor).to(device)
+    return torch.from_numpy(np.asarray(features[indices], dtype=np.float32)).to(device)
+
+
+def contrastive_pretrain(  # noqa: PLR0915
+    model: Student,
+    features: FeatureMatrix,
+    labels: np.ndarray,
+    positive_indices: np.ndarray,
+    negative_indices: np.ndarray,
+    device: torch.device,
+    *,
+    epochs: int,
+    batch_size: int,
+    temperature: float,
+    projection_dim: int,
+    learning_rate: float,
+    weight_decay: float,
+    seed: int,
+) -> dict:
+    """Pre-train transferable TabM representations on training labels only."""
+    if epochs == 0:
+        return {
+            "enabled": False,
+            "epochs": 0,
+            "validation_used_for_optimization": False,
+        }
+    if model.ple is not None:
+        msg = "contrastive pretraining is not compatible with PLE in the same cell"
+        raise ValueError(msg)
+
+    cpu_rng_state = torch.random.get_rng_state()
+    cuda_rng_states = torch.cuda.get_rng_state_all() if device.type == "cuda" else None
+    pretrain_seed = CONTRASTIVE_SEED_OFFSET + seed * EPOCH_SEED_STRIDE
+    history = []
+    started = time.perf_counter()
+    try:
+        torch.manual_seed(pretrain_seed)
+        if device.type == "cuda":
+            torch.cuda.manual_seed_all(pretrain_seed)
+
+        projection = nn.Linear(model.hidden_layers[-1], projection_dim).to(device)
+        trainable_parameters = [*model.backbone.parameters(), *projection.parameters()]
+        if model.input_scaling is not None:
+            trainable_parameters.extend(model.input_scaling.parameters())
+        optimizer = torch.optim.AdamW(
+            trainable_parameters,
+            lr=learning_rate,
+            weight_decay=weight_decay,
+        )
+        for epoch in range(1, epochs + 1):
+            epoch_seed = pretrain_seed + epoch
+            batches = balanced_contrastive_batches(
+                positive_indices,
+                negative_indices,
+                batch_size,
+                epoch_seed,
+            )
+            epoch_loss = 0.0
+            epoch_rows = 0
+            model.train()
+            projection.train()
+            for indices in batches:
+                batch_x = _contrastive_feature_batch(features, indices, device)
+                batch_y = torch.from_numpy((labels[indices] > 0).astype(np.int64)).to(device)
+                optimizer.zero_grad(set_to_none=True)
+                representation = model.representations(batch_x).mean(dim=1)
+                projected = projection(representation)
+                loss = supervised_contrastive_loss(projected, batch_y, temperature)
+                if not bool(torch.isfinite(loss)):
+                    msg = f"Non-finite contrastive loss in pretraining epoch {epoch}"
+                    raise FloatingPointError(msg)
+                loss.backward()
+                nn.utils.clip_grad_norm_(trainable_parameters, GRADIENT_CLIP_NORM)
+                optimizer.step()
+                epoch_loss += float(loss.detach()) * len(indices)
+                epoch_rows += len(indices)
+            mean_loss = epoch_loss / epoch_rows
+            if not np.isfinite(mean_loss):
+                msg = f"Non-finite contrastive loss at pretraining epoch {epoch}"
+                raise FloatingPointError(msg)
+            history.append(
+                {
+                    "epoch": epoch,
+                    "sampling_seed": epoch_seed,
+                    "rows": epoch_rows,
+                    "batches": len(batches),
+                    "loss": mean_loss,
+                }
+            )
+            print(
+                f"Contrastive pretrain {epoch:3d}/{epochs} | loss {mean_loss:.6f} | rows {epoch_rows:,}",
+                flush=True,
+            )
+    finally:
+        torch.random.set_rng_state(cpu_rng_state)
+        if cuda_rng_states is not None:
+            torch.cuda.set_rng_state_all(cuda_rng_states)
+
+    elapsed = time.perf_counter() - started
+    del projection, optimizer
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return {
+        "enabled": True,
+        "method": "binary-supervised-contrastive-v1",
+        "epochs": epochs,
+        "temperature": temperature,
+        "projection_dim": projection_dim,
+        "batch_size": batch_size,
+        "views": 1,
+        "input_augmentation": "none",
+        "label_definition": "binary int(training_label > 0)",
+        "sampler": "all-positives-unique-equal-negatives-v1",
+        "class_balance": "one-to-one positive/non-positive per batch",
+        "positive_rows_per_epoch": len(positive_indices),
+        "negative_rows_per_epoch": len(positive_indices),
+        "optimizer": "AdamW",
+        "learning_rate": learning_rate,
+        "weight_decay": weight_decay,
+        "seed_policy": "7000000 + run-seed*10000 + pretrain-epoch",
+        "torch_rng_restored_before_downstream_training": True,
+        "transferred_modules": ["input_scaling", "backbone"],
+        "discarded_modules": ["projection"],
+        "prediction_heads_updated": False,
+        "downstream_optimizer": "fresh AdamW over the complete student",
+        "validation_used_for_optimization": False,
+        "seconds": elapsed,
+        "history": history,
+    }
 
 
 @torch.inference_mode()
@@ -1684,8 +1919,10 @@ def member_ensemble_diagnostics(  # noqa: PLR0912, PLR0915
         else:
             batch_x = torch.from_numpy(features[start:stop]).to(device)
         detector_logits, severity_logits = model.forward_logits(batch_x)
-        detector_probability = torch.sigmoid(detector_logits)
-        severity_probability = torch.softmax(severity_logits, dim=-1)
+        detector_probability, severity_probability = model.member_probabilities(
+            detector_logits,
+            severity_logits,
+        )
         member_scores[start:stop] = detector_probability.transpose(0, 1).cpu().numpy()
         severity = severity_logits.argmax(dim=-1).transpose(0, 1) + 1
         member_severity[start:stop] = severity.cpu().numpy()
@@ -2168,6 +2405,7 @@ def _validate_args(args: argparse.Namespace) -> None:  # noqa: PLR0912, PLR0915
         "eval_batch_size": args.eval_batch_size,
         "negative_ratio": args.negative_ratio,
         "members": args.members,
+        "contrastive_projection_dim": args.contrastive_projection_dim,
     }
     for name, value in positive_integer_arguments.items():
         if value < 1:
@@ -2175,6 +2413,23 @@ def _validate_args(args: argparse.Namespace) -> None:  # noqa: PLR0912, PLR0915
             raise ValueError(msg)
 
     _validate_model_args(args)
+    if (
+        isinstance(args.contrastive_pretrain_epochs, bool)
+        or not isinstance(args.contrastive_pretrain_epochs, int)
+        or args.contrastive_pretrain_epochs < 0
+    ):
+        msg = "contrastive-pretrain-epochs must be a non-negative integer"
+        raise ValueError(msg)
+    if not np.isfinite(args.contrastive_temperature) or args.contrastive_temperature <= 0.0:
+        msg = "contrastive-temperature must be finite and positive"
+        raise ValueError(msg)
+    if args.contrastive_pretrain_epochs:
+        if args.batch_size < MIN_CONTRASTIVE_BATCH_SIZE or args.batch_size % 2:
+            msg = "contrastive pretraining requires an even batch-size of at least six"
+            raise ValueError(msg)
+        if args.preprocess == "ple64":
+            msg = "contrastive pretraining and PLE64 are separate experiment treatments"
+            raise ValueError(msg)
     if not np.isfinite(args.lr) or not np.isfinite(args.weight_decay) or args.lr <= 0.0 or args.weight_decay < 0.0:
         msg = "lr must be positive and weight-decay must be non-negative"
         raise ValueError(msg)
@@ -2185,6 +2440,12 @@ def _validate_args(args: argparse.Namespace) -> None:  # noqa: PLR0912, PLR0915
         raise ValueError(msg)
     if not np.isfinite(args.kd_temperature) or args.kd_temperature <= 0.0:
         msg = "kd-temperature must be finite and positive"
+        raise ValueError(msg)
+    if not np.isfinite(args.label_smoothing) or not 0.0 <= args.label_smoothing < 1.0:
+        msg = "label-smoothing must be finite and in [0, 1)"
+        raise ValueError(msg)
+    if not np.isfinite(args.prediction_temperature) or args.prediction_temperature <= 0.0:
+        msg = "prediction-temperature must be finite and positive"
         raise ValueError(msg)
     if args.negative_sampling not in NEGATIVE_SAMPLING_POLICIES:
         msg = f"negative-sampling must be one of {NEGATIVE_SAMPLING_POLICIES}"
@@ -2234,6 +2495,9 @@ def _validate_args(args: argparse.Namespace) -> None:  # noqa: PLR0912, PLR0915
         raise ValueError(msg)
     if args.epochs >= EPOCH_SEED_STRIDE:
         msg = f"epochs must be below {EPOCH_SEED_STRIDE} for collision-free sampling seeds"
+        raise ValueError(msg)
+    if args.contrastive_pretrain_epochs >= EPOCH_SEED_STRIDE:
+        msg = f"contrastive-pretrain-epochs must be below {EPOCH_SEED_STRIDE} for collision-free sampling seeds"
         raise ValueError(msg)
     if args.device == "cuda" and not torch.cuda.is_available():
         msg = "CUDA was requested but is not available"
@@ -2333,6 +2597,11 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         "action_policy": "legacy-recall",
         "policy_lambdas": list(DEFAULT_POLICY_LAMBDAS),
         "recall_targets": list(DEFAULT_RECALL_TARGETS),
+        "contrastive_pretrain_epochs": DEFAULT_CONTRASTIVE_PRETRAIN_EPOCHS,
+        "contrastive_temperature": DEFAULT_CONTRASTIVE_TEMPERATURE,
+        "contrastive_projection_dim": DEFAULT_CONTRASTIVE_PROJECTION_DIM,
+        "label_smoothing": DEFAULT_LABEL_SMOOTHING,
+        "prediction_temperature": DEFAULT_PREDICTION_TEMPERATURE,
     }
     for name, default in backward_compatible_defaults.items():
         if not hasattr(args, name):
@@ -2559,6 +2828,9 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         dropout=args.dropout,
         architecture=args.architecture,
         ple_config=ple_config,
+        # Temperature scaling is post-selection calibration. Keep checkpoint
+        # training and early stopping at the neutral temperature.
+        prediction_temperature=DEFAULT_PREDICTION_TEMPERATURE,
     )
     model.initialize_detector_bias(initial_detector_bias)
 
@@ -2577,6 +2849,22 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         args.eval_batch_size = min(args.eval_batch_size, 16384)
         print(f"PLE64: Reduced eval batch size to {args.eval_batch_size} for larger feature dimension")
 
+    contrastive_pretraining = contrastive_pretrain(
+        model,
+        train_x,
+        train_y,
+        positive_indices,
+        negative_indices,
+        device,
+        epochs=args.contrastive_pretrain_epochs,
+        batch_size=args.batch_size,
+        temperature=args.contrastive_temperature,
+        projection_dim=args.contrastive_projection_dim,
+        learning_rate=args.lr,
+        weight_decay=args.weight_decay,
+        seed=args.seed,
+    )
+
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -2590,6 +2878,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         "hidden": list(model.hidden_layers),
         "k": model.k,
         "dropout": model.dropout,
+        "prediction_temperature": args.prediction_temperature,
         "preprocess": args.preprocess,
         "preprocessing": metadata.get("preprocessing"),
         "effective_n_features": model.ple_output_dim,
@@ -2600,6 +2889,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         "total_parameters": total_params,
         "trainable_parameters": trainable_params,
         "cache_residency": cache_residency,
+        "contrastive_pretrained": contrastive_pretraining["enabled"],
     }
     if feature_projection is not None:
         model_metadata.update(
@@ -2653,6 +2943,15 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
             "negative_rows": n_negatives_full,
             "population_prevalence": population_prevalence,
         },
+        "contrastive_pretraining": contrastive_pretraining,
+        "advanced_training": {
+            "label_smoothing": args.label_smoothing,
+            "prediction_temperature": args.prediction_temperature,
+            "temperature_policy": (
+                "fixed detector and conditional-severity output-logit scaling after "
+                "probabilistic checkpoint selection; not optimized"
+            ),
+        },
     }
     if feature_projection is not None:
         training_protocol.update(
@@ -2662,7 +2961,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
             }
         )
     objective = {
-        "version": "dual-head-response-kd-ordinal-v4",
+        "version": "dual-head-response-kd-ordinal-label-smoothing-v5",
         "distill": args.distill,
         "hard_detector": "population-margin BCE with sampled-prior shift",
         "hard_severity": "conditional cross entropy on true-positive rows",
@@ -2674,6 +2973,8 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         "beta": args.beta,
         "lambda_sev": args.lambda_sev,
         "lambda_ordinal": args.lambda_ordinal,
+        "label_smoothing": args.label_smoothing,
+        "prediction_temperature": args.prediction_temperature,
         "kd_temperature": args.kd_temperature,
         "loss_component_reporting": "weighted mean per optimizer batch",
     }
@@ -2711,6 +3012,9 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
     print(f"Feature cache residency: {cache_residency}")
     print(f"Negative ratio: {args.negative_ratio}")
     print(f"Negative sampling: {args.negative_sampling}")
+    print(f"Contrastive pretraining: {contrastive_pretraining['enabled']}")
+    print(f"Label smoothing: {args.label_smoothing:g}")
+    print(f"Fixed post-selection prediction temperature: {args.prediction_temperature:g}")
     print(f"Conditional ordinal RPS weight: {args.lambda_ordinal:g}")
     if recall_controlled:
         print(f"Legacy post-checkpoint target detector recall: {args.target_recall:.1%}")
@@ -2749,6 +3053,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
             lambda_sev=args.lambda_sev,
             kd_temperature=args.kd_temperature,
             lambda_ordinal=args.lambda_ordinal,
+            label_smoothing=args.label_smoothing,
             positive_indices=positive_indices,
             negative_indices=negative_indices,
             epoch_sampler=epoch_sampler,
@@ -2941,8 +3246,34 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
     ):
         msg = "Loaded model state does not match the selected checkpoint"
         raise RuntimeError(msg)
-    final_probabilities = best_probabilities
-    final_detector_probability = best_detector_probability
+
+    # Checkpoint selection is deliberately temperature-neutral. Fixed Phase 3
+    # scaling is applied only after the canonical weights have been selected.
+    selection_probability = probability_metrics(best_probabilities, val_y)
+    selection_metrics = {
+        "ap": detection_ap(best_detector_probability, val_y),
+        "probability": selection_probability,
+    }
+    final_selection_key = checkpoint_selection_key(selection_metrics)
+    if not np.allclose(final_selection_key, best_selection_key, rtol=1e-12, atol=1e-15):
+        msg = "Cached selected-epoch predictions do not reproduce their validation selection key"
+        raise RuntimeError(msg)
+
+    model.prediction_temperature = args.prediction_temperature
+    if args.prediction_temperature == DEFAULT_PREDICTION_TEMPERATURE:
+        final_probabilities = best_probabilities
+        final_detector_probability = best_detector_probability
+    else:
+        print(
+            f"Applying fixed post-selection prediction temperature {args.prediction_temperature:g}",
+            flush=True,
+        )
+        final_probabilities, final_detector_probability = predict_joint_probabilities(
+            model,
+            val_x,
+            device,
+            batch_size=args.eval_batch_size,
+        )
     best_threshold = None
     threshold_source = None
     threshold_policy = None
@@ -2985,10 +3316,6 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
             val_y,
             args.policy_lambdas,
         )
-    final_selection_key = checkpoint_selection_key(final_metrics)
-    if not np.allclose(final_selection_key, best_selection_key, rtol=1e-12, atol=1e-15):
-        msg = "Cached selected-epoch predictions do not reproduce their validation selection key"
-        raise RuntimeError(msg)
     selection = {
         "policy": SELECTION_POLICY,
         "canonical": True,
@@ -2998,10 +3325,16 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         "criteria": list(SELECTION_CRITERIA),
         "best_epoch": best_epoch,
         "best_key": list(best_selection_key),
-        "selected_checkpoint_ranked_probability_score": float(final_metrics["probability"]["ranked_probability_score"]),
-        "selected_checkpoint_negative_log_likelihood": float(final_metrics["probability"]["negative_log_likelihood"]),
-        "selected_checkpoint_brier_score": float(final_metrics["probability"]["brier_score"]),
-        "selected_checkpoint_ap": float(final_metrics["ap"]),
+        "prediction_temperature_during_selection": DEFAULT_PREDICTION_TEMPERATURE,
+        "post_selection_prediction_temperature": args.prediction_temperature,
+        "selected_checkpoint_ranked_probability_score": float(
+            selection_metrics["probability"]["ranked_probability_score"]
+        ),
+        "selected_checkpoint_negative_log_likelihood": float(
+            selection_metrics["probability"]["negative_log_likelihood"]
+        ),
+        "selected_checkpoint_brier_score": float(selection_metrics["probability"]["brier_score"]),
+        "selected_checkpoint_ap": float(selection_metrics["ap"]),
         "min_rps_observed": min(row["validation_ranked_probability_score"] for row in history),
         "min_nll_observed": min(row["validation_negative_log_likelihood"] for row in history),
         "max_ap_observed": max(row["validation_ap"] for row in history),
@@ -3054,6 +3387,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
         "negative_sampling": args.negative_sampling,
         "hard_negative_fraction": (args.hard_negative_fraction if args.negative_sampling == "hard" else None),
         "lambda_ordinal": args.lambda_ordinal,
+        "label_smoothing": args.label_smoothing,
         "action_policy": args.action_policy,
         "recall_targets": (list(args.recall_targets) if recall_frontier_mode else None),
     }
@@ -3250,6 +3584,7 @@ def run(args: argparse.Namespace) -> dict:  # noqa: PLR0912, PLR0915
             "cache_load_seconds": cache_load_seconds,
             "index_pool_seconds": pool_seconds,
             "feature_staging_seconds": feature_staging_seconds,
+            "contrastive_pretraining_seconds": contrastive_pretraining.get("seconds", 0.0),
             "cache_residency": cache_residency,
             "final_diagnostics_seconds": final_diagnostics_seconds,
             "max_gpu_allocated_mib": max(row["gpu_peak_allocated_mib"] for row in history),
@@ -3400,6 +3735,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS, help="Maximum epochs")
     parser.add_argument("--patience", type=int, default=DEFAULT_PATIENCE, help="Early stopping patience")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE, help="Batch size")
+    parser.add_argument(
+        "--label-smoothing",
+        type=float,
+        default=DEFAULT_LABEL_SMOOTHING,
+        help="Uniform label smoothing for detector and conditional-severity hard-label losses",
+    )
+    parser.add_argument(
+        "--prediction-temperature",
+        type=float,
+        default=DEFAULT_PREDICTION_TEMPERATURE,
+        help="Fixed output-logit temperature used for post-selection validation diagnostics and inference",
+    )
+    parser.add_argument(
+        "--contrastive-pretrain-epochs",
+        type=int,
+        default=DEFAULT_CONTRASTIVE_PRETRAIN_EPOCHS,
+        help="Training-label-only supervised contrastive epochs before downstream training",
+    )
+    parser.add_argument(
+        "--contrastive-temperature",
+        type=float,
+        default=DEFAULT_CONTRASTIVE_TEMPERATURE,
+        help="Temperature for supervised contrastive pretraining",
+    )
+    parser.add_argument(
+        "--contrastive-projection-dim",
+        type=int,
+        default=DEFAULT_CONTRASTIVE_PROJECTION_DIM,
+        help="Temporary projection-head width used only during contrastive pretraining",
+    )
     parser.add_argument(
         "--eval-batch-size",
         type=int,

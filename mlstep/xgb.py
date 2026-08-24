@@ -11,7 +11,7 @@ import xgboost as xgb
 
 from mlstep.data import (
     DATA,
-    FEATURES,
+    FEATURE_SET_NAMES,
     N_CLASSES,
     Feature,
     discover_timesteps,
@@ -21,6 +21,7 @@ from mlstep.data import (
     load_selected_rows,
     load_timesteps,
     random_undersampling,
+    resolve_feature_set,
     split_timesteps,
     training_index_pools,
 )
@@ -95,7 +96,9 @@ def load_training_data(
 
 def run(args: argparse.Namespace) -> dict:  # noqa: PLR0915
     """Conduct the complete XGBoost experiment."""
-    features = FEATURES
+    feature_set = getattr(args, "feature_set", "baseline")
+    args.feature_set = feature_set
+    features = resolve_feature_set(feature_set)
     names = feature_names(features)
     groups = [feature.name for feature in features]
     task = "multiclass" if args.multiclass else "binary"
@@ -366,6 +369,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", type=Path, default=DATA)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument(
+        "--feature-set",
+        choices=FEATURE_SET_NAMES,
+        default="baseline",
+        help="Named input schema used by both training and validation",
+    )
     parser.add_argument("--multiclass", action="store_true")
     parser.add_argument("--dashboard", action="store_true")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")

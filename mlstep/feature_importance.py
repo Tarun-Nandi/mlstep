@@ -457,8 +457,10 @@ def load_analysis_inputs(  # noqa: PLR0912, PLR0915
                 "dropout",
                 "preprocess",
                 "ple_config",
+                "prediction_temperature",
             )
         }
+        comparable_config["prediction_temperature"] = config.get("prediction_temperature", 1.0)
         if expected_config is None:
             expected_config = comparable_config
         elif comparable_config != expected_config:
@@ -539,8 +541,10 @@ def _ensemble_joint_and_conditional(
 
         # Reproduce Student.forward and joint_distribution in the deployed
         # model dtype so headline joint/detector metrics do not change.
-        member_detector = torch.sigmoid(detector_logits)
-        member_severity = torch.softmax(severity_logits, dim=-1)
+        member_detector, member_severity = model.member_probabilities(
+            detector_logits,
+            severity_logits,
+        )
         detector = member_detector.mean(dim=0)
         positive_mass = (member_detector.unsqueeze(-1) * member_severity).mean(dim=0)
         conditional = positive_mass / detector.unsqueeze(-1).clamp_min(torch.finfo(detector.dtype).tiny)
@@ -551,8 +555,12 @@ def _ensemble_joint_and_conditional(
         # equal weight.  Constants common to every severity class cancel in
         # the final softmax, but retaining 1/K makes the checkpoint semantics
         # explicit and remains correct if models with different K are used.
-        member_log_positive = F.logsigmoid(detector_logits.to(torch.float64)).unsqueeze(-1)
-        member_log_positive = member_log_positive + F.log_softmax(severity_logits.to(torch.float64), dim=-1)
+        temperature = model.prediction_temperature
+        member_log_positive = F.logsigmoid(detector_logits.to(torch.float64) / temperature).unsqueeze(-1)
+        member_log_positive = member_log_positive + F.log_softmax(
+            severity_logits.to(torch.float64) / temperature,
+            dim=-1,
+        )
         checkpoint_log_positive = torch.logsumexp(member_log_positive, dim=0) - math.log(detector_logits.shape[0])
         log_positive_sum = (
             checkpoint_log_positive

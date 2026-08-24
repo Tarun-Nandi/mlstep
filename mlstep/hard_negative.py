@@ -188,8 +188,11 @@ def _comparable_checkpoint_config(config: dict[str, Any]) -> dict[str, Any]:
         "preprocess",
         "preprocessing",
         "ple_config",
+        "prediction_temperature",
     )
-    return {key: config.get(key) for key in keys}
+    comparable = {key: config.get(key) for key in keys}
+    comparable["prediction_temperature"] = config.get("prediction_temperature", 1.0)
+    return comparable
 
 
 def _validate_checkpoint_against_cache(
@@ -392,7 +395,8 @@ class StudentDetectorScorer:
             probability_sum: torch.Tensor | None = None
             for model in self.models:
                 detector_logits, _ = model.forward_logits(inputs)
-                probability = torch.sigmoid(detector_logits).mean(dim=0)
+                temperature = float(getattr(model, "prediction_temperature", 1.0))
+                probability = torch.sigmoid(detector_logits / temperature).mean(dim=0)
                 probability_sum = probability if probability_sum is None else probability_sum + probability
             assert probability_sum is not None
             mean_probability = probability_sum / len(self.models)
