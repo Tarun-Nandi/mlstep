@@ -1,18 +1,15 @@
-# Subdirectories
-mlstep.egg-info/
+.venv/
 __pycache__/
-CMakeFiles/
+.ruff_cache/
+*.egg-info/
 build/
-mlstep/data/
-mlstep/24hr_data
-plots/
+dist/
+cache/
+artifacts/
 runs/
-mlstep/plots/
-mlstep/runs/
-
-# Specific files
-CMakeCache.txt
-Makefile
-
-# File extensions
-*.cmake
+*.nc
+*.npy
+*.npz
+*.pt
+*.ubj
+/slurm/
