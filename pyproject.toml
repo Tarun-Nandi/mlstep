@@ -23,7 +23,7 @@ classifiers = [
 
 dependencies = [
     "netCDF4",
-    "numpy",
+    "numpy>=1.22",
     "scikit-learn",
     "torch>=2.3",
     "xarray",

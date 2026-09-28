@@ -7,6 +7,9 @@ dist/
 cache/
 artifacts/
 runs/
+results/
+/comparison-*/
+*.pdf
 *.nc
 *.npy
 *.npz
